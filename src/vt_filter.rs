@@ -10,7 +10,10 @@ use std::fmt::Write;
 /// we need to transform sequences in-place while forwarding all other bytes verbatim.
 
 /// State machine for parsing VT/CSI sequences in the output stream.
-enum FilterState {
+///
+/// This must be persisted across calls to `filter_child_output` so that
+/// sequences split across read boundaries are handled correctly.
+pub enum FilterState {
     /// Normal text passthrough
     Ground,
     /// Just saw ESC (0x1B)
@@ -25,22 +28,30 @@ enum FilterState {
     OscEscape,
 }
 
+impl FilterState {
+    pub fn new() -> Self {
+        FilterState::Ground
+    }
+}
+
 /// Process child PTY output, offsetting absolute coordinates for the border.
 /// Returns the transformed bytes to write to the outer terminal.
-pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16) -> Vec<u8> {
+///
+/// `state` must be persisted across calls so that sequences split across
+/// read boundaries are parsed correctly.
+pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16, state: &mut FilterState) -> Vec<u8> {
     let inner_height = outer_height.saturating_sub(2);
     let inner_width = outer_width.saturating_sub(2);
     let mut output = Vec::with_capacity(input.len() + input.len() / 4);
-    let mut state = FilterState::Ground;
 
     for &byte in input {
         match state {
             FilterState::Ground => {
                 if byte == 0x1B {
-                    state = FilterState::Escape;
+                    *state = FilterState::Escape;
                 } else if byte == 0x9B {
                     // 8-bit CSI
-                    state = FilterState::Csi { params: Vec::new() };
+                    *state = FilterState::Csi { params: Vec::new() };
                 } else {
                     output.push(byte);
                 }
@@ -48,18 +59,18 @@ pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16) ->
             FilterState::Escape => {
                 match byte {
                     b'[' => {
-                        state = FilterState::Csi { params: Vec::new() };
+                        *state = FilterState::Csi { params: Vec::new() };
                     }
                     b']' => {
                         // OSC sequence - pass through
                         output.extend_from_slice(b"\x1b]");
-                        state = FilterState::Osc;
+                        *state = FilterState::Osc;
                     }
                     _ => {
                         // Other escape sequence (e.g., ESC M for reverse index)
                         output.push(0x1B);
                         output.push(byte);
-                        state = FilterState::Ground;
+                        *state = FilterState::Ground;
                     }
                 }
             }
@@ -71,23 +82,23 @@ pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16) ->
                     // Final byte - process the CSI sequence
                     let transformed = transform_csi(params, byte, inner_width, inner_height);
                     output.extend_from_slice(transformed.as_bytes());
-                    state = FilterState::Ground;
+                    *state = FilterState::Ground;
                 } else {
                     // Unexpected byte - dump what we have
                     output.extend_from_slice(b"\x1b[");
                     output.extend_from_slice(params);
                     output.push(byte);
-                    state = FilterState::Ground;
+                    *state = FilterState::Ground;
                 }
             }
             FilterState::Osc => {
                 if byte == 0x07 {
                     // BEL terminates OSC
                     output.push(byte);
-                    state = FilterState::Ground;
+                    *state = FilterState::Ground;
                 } else if byte == 0x1B {
                     // Possible start of ST (ESC \)
-                    state = FilterState::OscEscape;
+                    *state = FilterState::OscEscape;
                 } else {
                     output.push(byte);
                 }
@@ -97,32 +108,19 @@ pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16) ->
                     // ST (ESC \) terminates OSC
                     output.push(0x1B);
                     output.push(byte);
-                    state = FilterState::Ground;
+                    *state = FilterState::Ground;
                 } else {
                     // Not ST, emit the ESC and continue in OSC
                     output.push(0x1B);
                     output.push(byte);
-                    state = FilterState::Osc;
+                    *state = FilterState::Osc;
                 }
             }
         }
     }
 
-    // Handle incomplete sequences at end of buffer
-    match state {
-        FilterState::Escape => {
-            output.push(0x1B);
-        }
-        FilterState::Csi { ref params } => {
-            output.extend_from_slice(b"\x1b[");
-            output.extend_from_slice(params);
-        }
-        FilterState::OscEscape => {
-            // ESC at end of OSC - emit the pending ESC
-            output.push(0x1B);
-        }
-        _ => {}
-    }
+    // Incomplete sequences are kept in `state` and will be completed
+    // on the next call. No flushing needed here.
 
     output
 }
@@ -213,9 +211,26 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
             }
         }
         b'K' => {
-            // EL (Erase in Line) - pass through, content area only
-            let param_str = std::str::from_utf8(params).unwrap_or("");
-            let _ = write!(result, "\x1b[{param_str}K");
+            // EL (Erase in Line) - convert to ECH to protect borders
+            let mode = nums.first().copied().unwrap_or(0);
+            match mode {
+                0 => {
+                    // Erase from cursor to end of line: use ECH with inner_width chars
+                    // (ECH won't go past the right edge, so this is safe even if
+                    // cursor is not at column 1)
+                    let _ = write!(result, "\x1b[{}X", inner_width);
+                }
+                2 => {
+                    // Erase entire line: save cursor, move to inner left edge,
+                    // erase inner_width chars, restore cursor
+                    let _ = write!(result, "\x1b7\x1b[{}G\x1b[{}X\x1b8", 2, inner_width);
+                }
+                _ => {
+                    // 1K (erase from start to cursor) is safe for borders
+                    let param_str = std::str::from_utf8(params).unwrap_or("");
+                    let _ = write!(result, "\x1b[{param_str}K");
+                }
+            }
         }
         b'A' | b'B' | b'C' | b'D' | b'E' | b'F' => {
             // Cursor movement (relative) - pass through without offset
@@ -268,39 +283,64 @@ fn transform_sgr_mouse(params: &[u8], final_byte: u8) -> String {
     }
 }
 
+/// Result of transforming mouse input.
+pub enum MouseTransform {
+    /// Successfully transformed to inner coordinates.
+    Transformed(Vec<u8>),
+    /// Click was on the border — should be ignored.
+    OnBorder,
+    /// Could not parse the sequence — forward original input unchanged.
+    ParseError,
+}
+
 /// Transform mouse input FROM the outer terminal TO the inner PTY.
 /// Removes the border offset from coordinates.
-/// Returns None if the click is on the border (outside inner area).
-pub fn transform_mouse_input(input: &[u8], outer_width: u16, outer_height: u16) -> Option<Vec<u8>> {
+pub fn transform_mouse_input(input: &[u8], outer_width: u16, outer_height: u16) -> MouseTransform {
     // Try to detect SGR mouse format: ESC [ < btn ; col ; row M/m
-    let s = std::str::from_utf8(input).ok()?;
+    let s = match std::str::from_utf8(input) {
+        Ok(s) => s,
+        Err(_) => return MouseTransform::ParseError,
+    };
 
     if let Some(rest) = s.strip_prefix("\x1b[<") {
         // SGR format
-        let end_idx = rest.find(['M', 'm'])?;
+        let end_idx = match rest.find(['M', 'm']) {
+            Some(i) => i,
+            None => return MouseTransform::ParseError,
+        };
         let final_char = rest.as_bytes()[end_idx];
         let params_str = &rest[..end_idx];
         let parts: Vec<&str> = params_str.split(';').collect();
 
         if parts.len() == 3 {
             let btn = parts[0];
-            let col: u16 = parts[1].parse().ok()?;
-            let row: u16 = parts[2].parse().ok()?;
+            let col: u16 = match parts[1].parse() {
+                Ok(v) => v,
+                Err(_) => return MouseTransform::ParseError,
+            };
+            let row: u16 = match parts[2].parse() {
+                Ok(v) => v,
+                Err(_) => return MouseTransform::ParseError,
+            };
 
             // Check if click is within inner area
             if col < 2 || col >= outer_width || row < 2 || row >= outer_height {
-                return None; // Click on border
+                return MouseTransform::OnBorder;
             }
 
             let inner_col = col - 1;
             let inner_row = row - 1;
 
-            return Some(format!("\x1b[<{btn};{inner_col};{inner_row}{}", final_char as char).into_bytes());
+            return MouseTransform::Transformed(
+                format!("\x1b[<{btn};{inner_col};{inner_row}{}", final_char as char).into_bytes(),
+            );
         }
+
+        return MouseTransform::ParseError;
     }
 
     // X10 mouse: ESC [ M Cb Cx Cy (all +32 encoded)
-    if input.len() == 6 && input[0] == 0x1B && input[1] == b'[' && input[2] == b'M' {
+    if input.len() >= 6 && input[0] == 0x1B && input[1] == b'[' && input[2] == b'M' {
         let cb = input[3];
         let cx = input[4];
         let cy = input[5];
@@ -309,17 +349,22 @@ pub fn transform_mouse_input(input: &[u8], outer_width: u16, outer_height: u16) 
         let row = cy.wrapping_sub(32) as u16;
 
         if col < 2 || col >= outer_width || row < 2 || row >= outer_height {
-            return None;
+            return MouseTransform::OnBorder;
         }
 
-        let inner_cx = (col - 1 + 32) as u8;
-        let inner_cy = (row - 1 + 32) as u8;
+        let inner_col = col - 1 + 32;
+        let inner_row = row - 1 + 32;
 
-        return Some(vec![0x1B, b'[', b'M', cb, inner_cx, inner_cy]);
+        // X10 format encodes coordinates in a single byte; values > 255 can't be represented
+        if inner_col > 255 || inner_row > 255 {
+            return MouseTransform::OnBorder;
+        }
+
+        return MouseTransform::Transformed(vec![0x1B, b'[', b'M', cb, inner_col as u8, inner_row as u8]);
     }
 
-    // Not a mouse sequence, pass through as-is
-    Some(input.to_vec())
+    // Not a recognized mouse sequence, forward as-is
+    MouseTransform::ParseError
 }
 
 /// Check if the output contains an alternate screen switch sequence.
@@ -364,7 +409,7 @@ mod tests {
     fn test_cup_offset() {
         // CSI 1;1 H should become CSI 2;2 H
         let input = b"\x1b[1;1H";
-        let output = filter_child_output(input, 80, 24);
+        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
         assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[2;2H");
     }
 
@@ -372,21 +417,21 @@ mod tests {
     fn test_cup_default_params() {
         // CSI H (no params) = row 1, col 1
         let input = b"\x1b[H";
-        let output = filter_child_output(input, 80, 24);
+        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
         assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[2;2H");
     }
 
     #[test]
     fn test_vpa_offset() {
         let input = b"\x1b[5d";
-        let output = filter_child_output(input, 80, 24);
+        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
         assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[6d");
     }
 
     #[test]
     fn test_cha_offset() {
         let input = b"\x1b[10G";
-        let output = filter_child_output(input, 80, 24);
+        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
         assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[11G");
     }
 
@@ -394,7 +439,7 @@ mod tests {
     fn test_decstbm_offset() {
         // CSI 1;22 r → CSI 2;23 r
         let input = b"\x1b[1;22r";
-        let output = filter_child_output(input, 80, 24);
+        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
         assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[2;23r");
     }
 
@@ -402,14 +447,14 @@ mod tests {
     fn test_relative_movement_passthrough() {
         // Relative cursor movement should pass through unchanged
         let input = b"\x1b[5A";
-        let output = filter_child_output(input, 80, 24);
+        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
         assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[5A");
     }
 
     #[test]
     fn test_plain_text_passthrough() {
         let input = b"Hello, world!";
-        let output = filter_child_output(input, 80, 24);
+        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
         assert_eq!(&output, input);
     }
 
@@ -417,7 +462,7 @@ mod tests {
     fn test_sgr_passthrough() {
         // Color sequences should pass through
         let input = b"\x1b[31mred\x1b[0m";
-        let output = filter_child_output(input, 80, 24);
+        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
         assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[31mred\x1b[0m");
     }
 
@@ -425,17 +470,79 @@ mod tests {
     fn test_mouse_input_transform() {
         // SGR mouse click at col 5, row 3 -> inner col 4, row 2
         let input = b"\x1b[<0;5;3M";
-        let result = transform_mouse_input(input, 80, 24);
-        assert!(result.is_some());
-        let out = result.unwrap();
-        assert_eq!(std::str::from_utf8(&out).unwrap(), "\x1b[<0;4;2M");
+        match transform_mouse_input(input, 80, 24) {
+            MouseTransform::Transformed(out) => {
+                assert_eq!(std::str::from_utf8(&out).unwrap(), "\x1b[<0;4;2M");
+            }
+            _ => panic!("expected Transformed"),
+        }
     }
 
     #[test]
     fn test_mouse_input_on_border() {
-        // Click at col 1, row 1 (top-left border) should be None
+        // Click at col 1, row 1 (top-left border) should be OnBorder
         let input = b"\x1b[<0;1;1M";
-        let result = transform_mouse_input(input, 80, 24);
-        assert!(result.is_none());
+        assert!(matches!(transform_mouse_input(input, 80, 24), MouseTransform::OnBorder));
+    }
+
+    #[test]
+    fn test_mouse_input_incomplete_sgr() {
+        // Incomplete SGR sequence should return ParseError, not drop input
+        let input = b"\x1b[<0;5";
+        assert!(matches!(transform_mouse_input(input, 80, 24), MouseTransform::ParseError));
+    }
+
+    #[test]
+    fn test_split_csi_across_calls() {
+        // CSI 1;1H split across two reads: first "\x1b[1" then ";1H"
+        let mut state = FilterState::new();
+        let out1 = filter_child_output(b"\x1b[1", 80, 24, &mut state);
+        let out2 = filter_child_output(b";1H", 80, 24, &mut state);
+
+        let combined = [out1, out2].concat();
+        // Should produce the same result as a single call
+        assert_eq!(std::str::from_utf8(&combined).unwrap(), "\x1b[2;2H");
+    }
+
+    #[test]
+    fn test_split_escape_then_bracket() {
+        // ESC at end of first read, '[' at start of second
+        let mut state = FilterState::new();
+        let out1 = filter_child_output(b"hello\x1b", 80, 24, &mut state);
+        let out2 = filter_child_output(b"[5;10H", 80, 24, &mut state);
+
+        let combined = [out1, out2].concat();
+        assert_eq!(
+            std::str::from_utf8(&combined).unwrap(),
+            "hello\x1b[6;11H"
+        );
+    }
+
+    #[test]
+    fn test_split_sgr_color_sequence() {
+        // Color sequence split: "\x1b[38;2;255" then ";128;0m"
+        let mut state = FilterState::new();
+        let out1 = filter_child_output(b"\x1b[38;2;255", 80, 24, &mut state);
+        let out2 = filter_child_output(b";128;0m", 80, 24, &mut state);
+
+        let combined = [out1, out2].concat();
+        assert_eq!(
+            std::str::from_utf8(&combined).unwrap(),
+            "\x1b[38;2;255;128;0m"
+        );
+    }
+
+    #[test]
+    fn test_split_text_between_sequences() {
+        // Normal text followed by a split sequence
+        let mut state = FilterState::new();
+        let out1 = filter_child_output(b"abc\x1b[", 80, 24, &mut state);
+        let out2 = filter_child_output(b"1;1Hxyz", 80, 24, &mut state);
+
+        let combined = [out1, out2].concat();
+        assert_eq!(
+            std::str::from_utf8(&combined).unwrap(),
+            "abc\x1b[2;2Hxyz"
+        );
     }
 }

@@ -87,7 +87,7 @@ pub fn spawn_child(
 
             // Exec the command
             let _ = execvp(&cmd, &c_args);
-            std::process::exit(1);
+            unsafe { libc::_exit(1) };
         }
         ForkResult::Parent { child } => {
             drop(slave);

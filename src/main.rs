@@ -109,6 +109,7 @@ fn run(
     let mut child_buf = [0u8; 8192];
 
     let mut stdout = io::stdout();
+    let mut filter_state = vt_filter::FilterState::new();
 
     loop {
         // Check signals
@@ -191,8 +192,9 @@ fn run(
                         cur_outer_cols,
                         cur_outer_rows,
                     ) {
-                        Some(transformed) => transformed,
-                        None => continue, // Click on border, ignore
+                        vt_filter::MouseTransform::Transformed(transformed) => transformed,
+                        vt_filter::MouseTransform::OnBorder => continue,
+                        vt_filter::MouseTransform::ParseError => input.to_vec(),
                     }
                 } else {
                     input.to_vec()
@@ -213,11 +215,11 @@ fn run(
                 let n = match nix::unistd::read(master_raw, &mut child_buf) {
                     Ok(0) => break,
                     Ok(n) => n,
-                    Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EIO) => {
+                    Err(nix::errno::Errno::EIO) => {
                         // EIO on master means child closed the slave
                         break;
                     }
-                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => continue,
                     Err(_) => break,
                 };
 
@@ -230,7 +232,7 @@ fn run(
 
                 // Filter and offset the output
                 let filtered =
-                    vt_filter::filter_child_output(raw_output, cur_outer_cols, cur_outer_rows);
+                    vt_filter::filter_child_output(raw_output, cur_outer_cols, cur_outer_rows, &mut filter_state);
 
                 stdout.write_all(&filtered).ok();
 
@@ -315,13 +317,16 @@ fn is_mouse_sequence(input: &[u8]) -> bool {
         return true;
     }
     // X10 mouse: ESC [ M followed by 3 bytes
-    if input.len() == 6 && input[0] == 0x1B && input[1] == b'[' && input[2] == b'M' {
+    if input.len() >= 6 && input[0] == 0x1B && input[1] == b'[' && input[2] == b'M' {
         return true;
     }
     false
 }
 
-/// Check if the output contains a full screen clear (CSI 2J or CSI 3J).
+/// Check if the output contains a screen erase (ED) that may damage borders.
+/// Matches CSI 0J, CSI 1J, CSI 2J, CSI 3J, and CSI J (default = 0J).
 fn has_full_clear(data: &[u8]) -> bool {
-    data.windows(4).any(|w| w == b"\x1b[2J" || w == b"\x1b[3J")
+    data.windows(4)
+        .any(|w| w == b"\x1b[2J" || w == b"\x1b[3J" || w == b"\x1b[0J" || w == b"\x1b[1J")
+        || data.windows(3).any(|w| w == b"\x1b[J")
 }
