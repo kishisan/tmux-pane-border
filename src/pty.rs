@@ -74,9 +74,12 @@ pub fn spawn_child(
             }
 
             // Redirect stdio to slave PTY
-            dup2(slave.as_raw_fd(), 0).ok();
-            dup2(slave.as_raw_fd(), 1).ok();
-            dup2(slave.as_raw_fd(), 2).ok();
+            if dup2(slave.as_raw_fd(), 0).is_err()
+                || dup2(slave.as_raw_fd(), 1).is_err()
+                || dup2(slave.as_raw_fd(), 2).is_err()
+            {
+                unsafe { libc::_exit(1) };
+            }
 
             if slave.as_raw_fd() > 2 {
                 drop(slave);

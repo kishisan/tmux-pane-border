@@ -20,8 +20,8 @@ struct Cli {
     #[arg(last = true, required = true)]
     command: Vec<String>,
 
-    /// Start in active state
-    #[arg(long, default_value_t = true)]
+    /// Start in active state (use --no-active to start inactive)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     active: bool,
 }
 

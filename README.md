@@ -70,9 +70,6 @@ Create `~/.config/tmux-pane-border/config.toml`:
 style = "rounded"          # rounded | heavy | double | single | ascii
 active_color = "#61afef"   # active pane border color
 inactive_color = "#5c6370" # inactive pane border color
-
-[behavior]
-dim_inactive = false       # dim content of inactive panes
 ```
 
 All options are optional — defaults are shown above.

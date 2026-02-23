@@ -21,6 +21,8 @@ enum FilterState {
     },
     /// Inside an OSC sequence (ESC ]) - pass through until ST
     Osc,
+    /// Inside an OSC sequence and just saw ESC - waiting for '\' to complete ST
+    OscEscape,
 }
 
 /// Process child PTY output, offsetting absolute coordinates for the border.
@@ -79,12 +81,29 @@ pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16) ->
                 }
             }
             FilterState::Osc => {
-                output.push(byte);
-                // OSC is terminated by BEL (0x07) or ST (ESC \)
                 if byte == 0x07 {
+                    // BEL terminates OSC
+                    output.push(byte);
                     state = FilterState::Ground;
+                } else if byte == 0x1B {
+                    // Possible start of ST (ESC \)
+                    state = FilterState::OscEscape;
+                } else {
+                    output.push(byte);
                 }
-                // Note: ESC \ detection would need look-ahead; BEL termination is most common
+            }
+            FilterState::OscEscape => {
+                if byte == b'\\' {
+                    // ST (ESC \) terminates OSC
+                    output.push(0x1B);
+                    output.push(byte);
+                    state = FilterState::Ground;
+                } else {
+                    // Not ST, emit the ESC and continue in OSC
+                    output.push(0x1B);
+                    output.push(byte);
+                    state = FilterState::Osc;
+                }
             }
         }
     }
@@ -97,6 +116,10 @@ pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16) ->
         FilterState::Csi { ref params } => {
             output.extend_from_slice(b"\x1b[");
             output.extend_from_slice(params);
+        }
+        FilterState::OscEscape => {
+            // ESC at end of OSC - emit the pending ESC
+            output.push(0x1B);
         }
         _ => {}
     }
@@ -181,6 +204,8 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
                     for row in 2..=(inner_height + 1) {
                         let _ = write!(result, "\x1b[{row};2H\x1b[{}X", inner_width);
                     }
+                    // Restore cursor to inner area top-left, matching expected ED 2J behavior
+                    let _ = write!(result, "\x1b[2;2H");
                 }
                 _ => {
                     let _ = write!(result, "\x1b[{mode}J");

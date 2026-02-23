@@ -6,7 +6,6 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct Config {
     pub border: BorderConfig,
-    pub behavior: BehaviorConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -15,12 +14,6 @@ pub struct BorderConfig {
     pub style: BorderStyle,
     pub active_color: String,
     pub inactive_color: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct BehaviorConfig {
-    pub dim_inactive: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -37,7 +30,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             border: BorderConfig::default(),
-            behavior: BehaviorConfig::default(),
         }
     }
 }
@@ -52,19 +44,17 @@ impl Default for BorderConfig {
     }
 }
 
-impl Default for BehaviorConfig {
-    fn default() -> Self {
-        Self {
-            dim_inactive: false,
-        }
-    }
-}
-
 impl Config {
     pub fn load() -> Self {
         let path = config_path();
         match fs::read_to_string(&path) {
-            Ok(content) => toml::from_str(&content).unwrap_or_default(),
+            Ok(content) => match toml::from_str(&content) {
+                Ok(config) => config,
+                Err(e) => {
+                    eprintln!("tmux-pane-border: warning: failed to parse {}: {e}", path.display());
+                    Self::default()
+                }
+            },
             Err(_) => Self::default(),
         }
     }
