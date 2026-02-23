@@ -65,6 +65,22 @@ pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16, bo
                     // BUG 1 fix: \r would move cursor to column 1 (left border).
                     // Convert to CHA column 2 (inner left edge) instead.
                     output.extend_from_slice(b"\x1b[2G");
+                } else if byte == 0x0A {
+                    // LF: pass through, then repair bottom row side borders.
+                    // When cursor is on the scroll region bottom row, LF triggers
+                    // a scroll that shifts side border characters up, leaving the
+                    // new bottom row without borders.
+                    output.push(byte);
+                    let v = border_info.vertical_char;
+                    let color = border_info.color_seq;
+                    let reset = "\x1b[0m";
+                    let bottom_row = outer_height - 1;
+                    let mut repair = String::new();
+                    let _ = write!(
+                        repair,
+                        "\x1b7\x1b[{bottom_row};1H{color}{v}{reset}\x1b[{bottom_row};{outer_width}H{color}{v}{reset}\x1b8",
+                    );
+                    output.extend_from_slice(repair.as_bytes());
                 } else {
                     output.push(byte);
                 }
@@ -182,11 +198,11 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
             let new_row = row.min(inner_height) + 1;
             let _ = write!(result, "\x1b[{new_row}d");
         }
-        b'G' => {
-            // CHA: CSI col G
+        b'G' | b'`' => {
+            // CHA: CSI col G  /  HPA: CSI col `
             let col = nums.first().copied().unwrap_or(1).max(1);
             let new_col = col.min(inner_width) + 1;
-            let _ = write!(result, "\x1b[{new_col}G");
+            let _ = write!(result, "\x1b[{new_col}{}", final_byte as char);
         }
         b'r' if !is_private => {
             // DECSTBM: CSI top ; bottom r
@@ -201,13 +217,23 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
             let mode = nums.first().copied().unwrap_or(0);
             match mode {
                 0 => {
-                    // Erase from cursor to end - pass through but we'll need
-                    // to redraw the border afterward (handled in main loop)
-                    let _ = write!(result, "\x1b[J");
+                    // Erase from cursor to end: cursor position unknown,
+                    // so conservatively clear entire inner area.
+                    // Save/restore cursor since our row-by-row erase moves it.
+                    let _ = write!(result, "\x1b7"); // save cursor
+                    for row in 2..=(inner_height + 1) {
+                        let _ = write!(result, "\x1b[{row};2H\x1b[{}X", inner_width);
+                    }
+                    let _ = write!(result, "\x1b8"); // restore cursor
                 }
                 1 => {
-                    // Erase from beginning to cursor
-                    let _ = write!(result, "\x1b[1J");
+                    // Erase from beginning to cursor: cursor position unknown,
+                    // so conservatively clear entire inner area.
+                    let _ = write!(result, "\x1b7"); // save cursor
+                    for row in 2..=(inner_height + 1) {
+                        let _ = write!(result, "\x1b[{row};2H\x1b[{}X", inner_width);
+                    }
+                    let _ = write!(result, "\x1b8"); // restore cursor
                 }
                 2 | 3 => {
                     // Erase entire display - we convert to clearing inner area only
@@ -605,10 +631,17 @@ mod tests {
 
     #[test]
     fn test_newline_with_cr() {
-        // \n should pass through, \r should become CHA(2)
+        // \r should become CHA(2), \n should pass through + border repair
         let input = b"\r\n";
         let output = filter(input, 80, 24, &mut FilterState::new());
-        assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[2G\n");
+        let s = std::str::from_utf8(&output).unwrap();
+        // Starts with CR->CHA(2) then LF
+        assert!(s.starts_with("\x1b[2G\n"));
+        // LF triggers border repair
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b[23;1H"));
+        assert!(s.contains("\x1b[23;80H"));
+        assert!(s.contains("\x1b8"));
     }
 
     #[test]
@@ -672,5 +705,104 @@ mod tests {
         assert!(s.contains("\x1b[80G"));
         // Should contain two border chars
         assert_eq!(s.matches('│').count(), 2);
+    }
+
+    // === New bug fix tests ===
+
+    #[test]
+    fn test_ed_0j_converts_to_ech_rows() {
+        // ED 0J (erase from cursor to end) should be converted to row-by-row ECH
+        // with cursor save/restore, instead of passing through raw CSI J
+        let input = b"\x1b[J"; // ED 0J (default)
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        // Should save cursor
+        assert!(s.starts_with("\x1b7"));
+        // Should contain ECH for inner rows (rows 2..=23 for 24-row outer)
+        assert!(s.contains("\x1b[2;2H\x1b[78X"));
+        assert!(s.contains("\x1b[23;2H\x1b[78X"));
+        // Should restore cursor
+        assert!(s.ends_with("\x1b8"));
+        // Should NOT contain raw ED sequence
+        assert!(!s.contains("\x1b[J"));
+        assert!(!s.contains("\x1b[0J"));
+    }
+
+    #[test]
+    fn test_ed_0j_explicit_param() {
+        // ED with explicit 0 parameter
+        let input = b"\x1b[0J";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with("\x1b7"));
+        assert!(s.contains("\x1b[2;2H\x1b[78X"));
+        assert!(s.ends_with("\x1b8"));
+    }
+
+    #[test]
+    fn test_ed_1j_converts_to_ech_rows() {
+        // ED 1J (erase from beginning to cursor) should also be converted
+        let input = b"\x1b[1J";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with("\x1b7"));
+        assert!(s.contains("\x1b[2;2H\x1b[78X"));
+        assert!(s.contains("\x1b[23;2H\x1b[78X"));
+        assert!(s.ends_with("\x1b8"));
+    }
+
+    #[test]
+    fn test_hpa_offset() {
+        // HPA (CSI col `) should get same offset as CHA (CSI col G)
+        let input = b"\x1b[10`";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[11`");
+    }
+
+    #[test]
+    fn test_hpa_default_param() {
+        // HPA with no param defaults to column 1
+        let input = b"\x1b[`";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[2`");
+    }
+
+    #[test]
+    fn test_hpa_clamped() {
+        // HPA beyond inner width should be clamped
+        let input = b"\x1b[200`";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        // inner_width = 78, so clamped to 78+1=79
+        assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[79`");
+    }
+
+    #[test]
+    fn test_lf_repairs_bottom_border() {
+        // LF should pass through and append bottom-row border repair
+        let input = b"\n";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        // Should start with the LF itself
+        assert!(s.starts_with('\n'));
+        // Should save cursor
+        assert!(s.contains("\x1b7"));
+        // Should draw left border at bottom row (row 23), col 1
+        assert!(s.contains("\x1b[23;1H"));
+        // Should draw right border at bottom row, col 80
+        assert!(s.contains("\x1b[23;80H"));
+        // Should contain two border chars
+        assert_eq!(s.matches('│').count(), 2);
+        // Should restore cursor
+        assert!(s.contains("\x1b8"));
+    }
+
+    #[test]
+    fn test_lf_in_text_stream() {
+        // Multiple LFs in text should each get border repair
+        let input = b"a\nb\n";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        // Should have 2 LFs and thus 4 border chars (2 per LF)
+        assert_eq!(s.matches('│').count(), 4);
     }
 }

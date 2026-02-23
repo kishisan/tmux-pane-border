@@ -262,6 +262,10 @@ fn run(
                         },
                     );
                     stdout.write_all(border_str.as_bytes()).ok();
+                    // Re-set scroll region (alt screen exit resets it)
+                    let inner_top = 2;
+                    let inner_bottom = cur_outer_rows - 1;
+                    write!(stdout, "\x1b[{inner_top};{inner_bottom}r").ok();
                 }
 
                 stdout.flush().ok();
@@ -337,9 +341,8 @@ fn is_mouse_sequence(input: &[u8]) -> bool {
 }
 
 /// Check if the output contains a screen erase (ED) that may damage borders.
-/// Matches CSI 0J, CSI 1J, CSI 2J, CSI 3J, and CSI J (default = 0J).
+/// Only matches CSI 2J and CSI 3J; ED 0J/1J/J are handled by the VT filter.
 fn has_full_clear(data: &[u8]) -> bool {
     data.windows(4)
-        .any(|w| w == b"\x1b[2J" || w == b"\x1b[3J" || w == b"\x1b[0J" || w == b"\x1b[1J")
-        || data.windows(3).any(|w| w == b"\x1b[J")
+        .any(|w| w == b"\x1b[2J" || w == b"\x1b[3J")
 }
