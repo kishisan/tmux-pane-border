@@ -34,12 +34,21 @@ impl FilterState {
     }
 }
 
+/// Border rendering info needed to redraw individual border characters
+/// after erase operations that damage the border.
+pub struct BorderInfo<'a> {
+    /// The vertical border character (e.g., '│')
+    pub vertical_char: char,
+    /// The ANSI color sequence for the border (e.g., "\x1b[38;2;r;g;bm")
+    pub color_seq: &'a str,
+}
+
 /// Process child PTY output, offsetting absolute coordinates for the border.
 /// Returns the transformed bytes to write to the outer terminal.
 ///
 /// `state` must be persisted across calls so that sequences split across
 /// read boundaries are parsed correctly.
-pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16, state: &mut FilterState) -> Vec<u8> {
+pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16, border_info: &BorderInfo, state: &mut FilterState) -> Vec<u8> {
     let inner_height = outer_height.saturating_sub(2);
     let inner_width = outer_width.saturating_sub(2);
     let mut output = Vec::with_capacity(input.len() + input.len() / 4);
@@ -52,6 +61,10 @@ pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16, st
                 } else if byte == 0x9B {
                     // 8-bit CSI
                     *state = FilterState::Csi { params: Vec::new() };
+                } else if byte == 0x0D {
+                    // BUG 1 fix: \r would move cursor to column 1 (left border).
+                    // Convert to CHA column 2 (inner left edge) instead.
+                    output.extend_from_slice(b"\x1b[2G");
                 } else {
                     output.push(byte);
                 }
@@ -80,7 +93,7 @@ pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16, st
                     params.push(byte);
                 } else if byte >= 0x40 && byte <= 0x7E {
                     // Final byte - process the CSI sequence
-                    let transformed = transform_csi(params, byte, inner_width, inner_height);
+                    let transformed = transform_csi(params, byte, inner_width, inner_height, outer_width, border_info);
                     output.extend_from_slice(transformed.as_bytes());
                     *state = FilterState::Ground;
                 } else {
@@ -137,7 +150,7 @@ fn parse_params(params: &[u8]) -> Vec<u16> {
 }
 
 /// Transform a CSI sequence, applying coordinate offsets where needed.
-fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: u16) -> String {
+fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: u16, outer_width: u16, border_info: &BorderInfo) -> String {
     let mut result = String::new();
 
     // Check for private mode prefix (?)
@@ -211,31 +224,50 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
             }
         }
         b'K' => {
-            // EL (Erase in Line) - convert to ECH to protect borders
+            // EL (Erase in Line) - pass through but repair damaged borders
             let mode = nums.first().copied().unwrap_or(0);
+            let v = border_info.vertical_char;
+            let color = border_info.color_seq;
+            let reset = "\x1b[0m";
             match mode {
                 0 => {
-                    // Erase from cursor to end of line: use ECH with inner_width chars
-                    // (ECH won't go past the right edge, so this is safe even if
-                    // cursor is not at column 1)
-                    let _ = write!(result, "\x1b[{}X", inner_width);
+                    // BUG 2 fix: Erase from cursor to end of line.
+                    // Pass through CSI K (terminal handles the erase correctly),
+                    // then redraw right border character which gets erased.
+                    let _ = write!(result, "\x1b[K\x1b7\x1b[{outer_width}G{color}{v}{reset}\x1b8");
+                }
+                1 => {
+                    // BUG 4 fix: Erase from beginning of line to cursor.
+                    // CSI 1K erases from column 1, destroying left border.
+                    // Pass through then redraw left border character.
+                    let _ = write!(result, "\x1b[1K\x1b7\x1b[1G{color}{v}{reset}\x1b8");
                 }
                 2 => {
-                    // Erase entire line: save cursor, move to inner left edge,
-                    // erase inner_width chars, restore cursor
-                    let _ = write!(result, "\x1b7\x1b[{}G\x1b[{}X\x1b8", 2, inner_width);
+                    // Erase entire line: pass through, then redraw both borders.
+                    let _ = write!(result, "\x1b[2K\x1b7\x1b[1G{color}{v}{reset}\x1b[{outer_width}G{color}{v}{reset}\x1b8");
                 }
                 _ => {
-                    // 1K (erase from start to cursor) is safe for borders
                     let param_str = std::str::from_utf8(params).unwrap_or("");
                     let _ = write!(result, "\x1b[{param_str}K");
                 }
             }
         }
-        b'A' | b'B' | b'C' | b'D' | b'E' | b'F' => {
+        b'A' | b'B' | b'C' | b'D' => {
             // Cursor movement (relative) - pass through without offset
             let param_str = std::str::from_utf8(params).unwrap_or("");
             let _ = write!(result, "\x1b[{param_str}{}", final_byte as char);
+        }
+        b'E' => {
+            // BUG 3 fix: CNL (Cursor Next Line) moves down then to column 1.
+            // Convert to CUD (down) + CHA column 2 to stay inside border.
+            let param_str = std::str::from_utf8(params).unwrap_or("");
+            let _ = write!(result, "\x1b[{param_str}B\x1b[2G");
+        }
+        b'F' => {
+            // BUG 3 fix: CPL (Cursor Previous Line) moves up then to column 1.
+            // Convert to CUU (up) + CHA column 2 to stay inside border.
+            let param_str = std::str::from_utf8(params).unwrap_or("");
+            let _ = write!(result, "\x1b[{param_str}A\x1b[2G");
         }
         b'h' | b'l' if is_private => {
             // Private mode set/reset (e.g., ?1049h for alternate screen, ?25h for cursor)
@@ -405,11 +437,22 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    fn test_border_info() -> BorderInfo<'static> {
+        BorderInfo {
+            vertical_char: '│',
+            color_seq: "\x1b[38;2;97;175;239m",
+        }
+    }
+
+    fn filter(input: &[u8], outer_width: u16, outer_height: u16, state: &mut FilterState) -> Vec<u8> {
+        filter_child_output(input, outer_width, outer_height, &test_border_info(), state)
+    }
+
     #[test]
     fn test_cup_offset() {
         // CSI 1;1 H should become CSI 2;2 H
         let input = b"\x1b[1;1H";
-        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
+        let output = filter(input, 80, 24, &mut FilterState::new());
         assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[2;2H");
     }
 
@@ -417,21 +460,21 @@ mod tests {
     fn test_cup_default_params() {
         // CSI H (no params) = row 1, col 1
         let input = b"\x1b[H";
-        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
+        let output = filter(input, 80, 24, &mut FilterState::new());
         assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[2;2H");
     }
 
     #[test]
     fn test_vpa_offset() {
         let input = b"\x1b[5d";
-        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
+        let output = filter(input, 80, 24, &mut FilterState::new());
         assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[6d");
     }
 
     #[test]
     fn test_cha_offset() {
         let input = b"\x1b[10G";
-        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
+        let output = filter(input, 80, 24, &mut FilterState::new());
         assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[11G");
     }
 
@@ -439,7 +482,7 @@ mod tests {
     fn test_decstbm_offset() {
         // CSI 1;22 r → CSI 2;23 r
         let input = b"\x1b[1;22r";
-        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
+        let output = filter(input, 80, 24, &mut FilterState::new());
         assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[2;23r");
     }
 
@@ -447,14 +490,14 @@ mod tests {
     fn test_relative_movement_passthrough() {
         // Relative cursor movement should pass through unchanged
         let input = b"\x1b[5A";
-        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
+        let output = filter(input, 80, 24, &mut FilterState::new());
         assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[5A");
     }
 
     #[test]
     fn test_plain_text_passthrough() {
         let input = b"Hello, world!";
-        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
+        let output = filter(input, 80, 24, &mut FilterState::new());
         assert_eq!(&output, input);
     }
 
@@ -462,7 +505,7 @@ mod tests {
     fn test_sgr_passthrough() {
         // Color sequences should pass through
         let input = b"\x1b[31mred\x1b[0m";
-        let output = filter_child_output(input, 80, 24, &mut FilterState::new());
+        let output = filter(input, 80, 24, &mut FilterState::new());
         assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[31mred\x1b[0m");
     }
 
@@ -495,9 +538,10 @@ mod tests {
     #[test]
     fn test_split_csi_across_calls() {
         // CSI 1;1H split across two reads: first "\x1b[1" then ";1H"
+        let bi = test_border_info();
         let mut state = FilterState::new();
-        let out1 = filter_child_output(b"\x1b[1", 80, 24, &mut state);
-        let out2 = filter_child_output(b";1H", 80, 24, &mut state);
+        let out1 = filter_child_output(b"\x1b[1", 80, 24, &bi, &mut state);
+        let out2 = filter_child_output(b";1H", 80, 24, &bi, &mut state);
 
         let combined = [out1, out2].concat();
         // Should produce the same result as a single call
@@ -507,9 +551,10 @@ mod tests {
     #[test]
     fn test_split_escape_then_bracket() {
         // ESC at end of first read, '[' at start of second
+        let bi = test_border_info();
         let mut state = FilterState::new();
-        let out1 = filter_child_output(b"hello\x1b", 80, 24, &mut state);
-        let out2 = filter_child_output(b"[5;10H", 80, 24, &mut state);
+        let out1 = filter_child_output(b"hello\x1b", 80, 24, &bi, &mut state);
+        let out2 = filter_child_output(b"[5;10H", 80, 24, &bi, &mut state);
 
         let combined = [out1, out2].concat();
         assert_eq!(
@@ -521,9 +566,10 @@ mod tests {
     #[test]
     fn test_split_sgr_color_sequence() {
         // Color sequence split: "\x1b[38;2;255" then ";128;0m"
+        let bi = test_border_info();
         let mut state = FilterState::new();
-        let out1 = filter_child_output(b"\x1b[38;2;255", 80, 24, &mut state);
-        let out2 = filter_child_output(b";128;0m", 80, 24, &mut state);
+        let out1 = filter_child_output(b"\x1b[38;2;255", 80, 24, &bi, &mut state);
+        let out2 = filter_child_output(b";128;0m", 80, 24, &bi, &mut state);
 
         let combined = [out1, out2].concat();
         assert_eq!(
@@ -535,14 +581,96 @@ mod tests {
     #[test]
     fn test_split_text_between_sequences() {
         // Normal text followed by a split sequence
+        let bi = test_border_info();
         let mut state = FilterState::new();
-        let out1 = filter_child_output(b"abc\x1b[", 80, 24, &mut state);
-        let out2 = filter_child_output(b"1;1Hxyz", 80, 24, &mut state);
+        let out1 = filter_child_output(b"abc\x1b[", 80, 24, &bi, &mut state);
+        let out2 = filter_child_output(b"1;1Hxyz", 80, 24, &bi, &mut state);
 
         let combined = [out1, out2].concat();
         assert_eq!(
             std::str::from_utf8(&combined).unwrap(),
             "abc\x1b[2;2Hxyz"
         );
+    }
+
+    // === Bug fix tests ===
+
+    #[test]
+    fn test_cr_converts_to_cha2() {
+        // BUG 1: \r should become \x1b[2G (CHA column 2) instead of going to column 1
+        let input = b"\r";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[2G");
+    }
+
+    #[test]
+    fn test_newline_with_cr() {
+        // \n should pass through, \r should become CHA(2)
+        let input = b"\r\n";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[2G\n");
+    }
+
+    #[test]
+    fn test_csi_e_cnl_converts_to_b_plus_cha() {
+        // BUG 3: CSI 3E (Cursor Next Line) should become CSI 3B + CHA(2)
+        let input = b"\x1b[3E";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[3B\x1b[2G");
+    }
+
+    #[test]
+    fn test_csi_f_cpl_converts_to_a_plus_cha() {
+        // BUG 3: CSI 2F (Cursor Previous Line) should become CSI 2A + CHA(2)
+        let input = b"\x1b[2F";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[2A\x1b[2G");
+    }
+
+    #[test]
+    fn test_el_0k_redraws_right_border() {
+        // BUG 2: CSI K (erase to end of line) should pass through and redraw right border
+        let input = b"\x1b[K";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        // Should contain the EL sequence
+        assert!(s.starts_with("\x1b[K"));
+        // Should contain save cursor, move to column 80, draw border char, reset, restore cursor
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b[80G"));
+        assert!(s.contains('│'));
+        assert!(s.contains("\x1b[0m"));
+        assert!(s.contains("\x1b8"));
+    }
+
+    #[test]
+    fn test_el_1k_redraws_left_border() {
+        // BUG 4: CSI 1K (erase from start of line) should pass through and redraw left border
+        let input = b"\x1b[1K";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        // Should contain the EL 1K sequence
+        assert!(s.starts_with("\x1b[1K"));
+        // Should contain save cursor, move to column 1, draw border char, reset, restore cursor
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b[1G"));
+        assert!(s.contains('│'));
+        assert!(s.contains("\x1b[0m"));
+        assert!(s.contains("\x1b8"));
+    }
+
+    #[test]
+    fn test_el_2k_redraws_both_borders() {
+        // CSI 2K (erase entire line) should redraw both borders
+        let input = b"\x1b[2K";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with("\x1b[2K"));
+        // Should redraw left border at column 1
+        assert!(s.contains("\x1b[1G"));
+        // Should redraw right border at column 80
+        assert!(s.contains("\x1b[80G"));
+        // Should contain two border chars
+        assert_eq!(s.matches('│').count(), 2);
     }
 }

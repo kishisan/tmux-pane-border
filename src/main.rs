@@ -110,6 +110,7 @@ fn run(
 
     let mut stdout = io::stdout();
     let mut filter_state = vt_filter::FilterState::new();
+    let (_, _, _, _, _, v_char) = border::style_chars(config.border.style);
 
     loop {
         // Check signals
@@ -230,9 +231,21 @@ fn run(
                     || vt_filter::has_alt_screen_leave(raw_output)
                     || has_full_clear(raw_output);
 
+                // Build border info for the VT filter (needed for border repair)
+                let active_color_str = if is_active {
+                    &config.border.active_color
+                } else {
+                    &config.border.inactive_color
+                };
+                let color_seq = border::fg_color_seq(active_color_str);
+                let border_info = vt_filter::BorderInfo {
+                    vertical_char: v_char,
+                    color_seq: &color_seq,
+                };
+
                 // Filter and offset the output
                 let filtered =
-                    vt_filter::filter_child_output(raw_output, cur_outer_cols, cur_outer_rows, &mut filter_state);
+                    vt_filter::filter_child_output(raw_output, cur_outer_cols, cur_outer_rows, &border_info, &mut filter_state);
 
                 stdout.write_all(&filtered).ok();
 

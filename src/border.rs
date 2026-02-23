@@ -2,7 +2,7 @@ use crate::config::BorderStyle;
 use std::fmt::Write;
 
 /// Characters for each border style: (top_left, top_right, bottom_left, bottom_right, horizontal, vertical)
-fn style_chars(style: BorderStyle) -> (char, char, char, char, char, char) {
+pub fn style_chars(style: BorderStyle) -> (char, char, char, char, char, char) {
     match style {
         BorderStyle::Rounded => ('╭', '╮', '╰', '╯', '─', '│'),
         BorderStyle::Heavy => ('┏', '┓', '┗', '┛', '━', '┃'),
@@ -25,7 +25,7 @@ fn parse_hex_color(color: &str) -> Option<(u8, u8, u8)> {
 }
 
 /// Generate the ANSI escape sequence to set foreground color from a hex string.
-fn fg_color_seq(color: &str) -> String {
+pub fn fg_color_seq(color: &str) -> String {
     if let Some((r, g, b)) = parse_hex_color(color) {
         format!("\x1b[38;2;{r};{g};{b}m")
     } else {
