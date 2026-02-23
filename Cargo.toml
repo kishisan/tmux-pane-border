@@ -6,7 +6,6 @@ description = "PTY wrapper that draws a colored border around tmux panes"
 license = "MIT"
 
 [dependencies]
-vte = "0.13"
 nix = { version = "0.29", features = ["term", "ioctl", "signal", "poll", "process", "fs"] }
 signal-hook = "0.3"
 clap = { version = "4", features = ["derive"] }

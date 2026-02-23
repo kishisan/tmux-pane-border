@@ -95,8 +95,27 @@ pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16, bo
                         output.extend_from_slice(b"\x1b]");
                         *state = FilterState::Osc;
                     }
+                    b'M' => {
+                        // Reverse Index: pass through, then repair top scroll row side borders.
+                        // When cursor is on the scroll region top row, ESC M triggers
+                        // a reverse scroll that shifts side border characters down, leaving
+                        // the new top row without borders.
+                        output.push(0x1B);
+                        output.push(byte);
+                        let v = border_info.vertical_char;
+                        let color = border_info.color_seq;
+                        let reset = "\x1b[0m";
+                        let top_row = 2u16;
+                        let mut repair = String::new();
+                        let _ = write!(
+                            repair,
+                            "\x1b7\x1b[{top_row};1H{color}{v}{reset}\x1b[{top_row};{outer_width}H{color}{v}{reset}\x1b8",
+                        );
+                        output.extend_from_slice(repair.as_bytes());
+                        *state = FilterState::Ground;
+                    }
                     _ => {
-                        // Other escape sequence (e.g., ESC M for reverse index)
+                        // Other escape sequences - pass through unchanged
                         output.push(0x1B);
                         output.push(byte);
                         *state = FilterState::Ground;
@@ -804,5 +823,25 @@ mod tests {
         let s = std::str::from_utf8(&output).unwrap();
         // Should have 2 LFs and thus 4 border chars (2 per LF)
         assert_eq!(s.matches('│').count(), 4);
+    }
+
+    #[test]
+    fn test_reverse_index_repairs_top_border() {
+        // ESC M (Reverse Index) should pass through and repair top row side borders
+        let input = b"\x1bM";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        // Should start with ESC M
+        assert!(s.starts_with("\x1bM"));
+        // Should save cursor
+        assert!(s.contains("\x1b7"));
+        // Should draw left border at top row (row 2), col 1
+        assert!(s.contains("\x1b[2;1H"));
+        // Should draw right border at top row, col 80
+        assert!(s.contains("\x1b[2;80H"));
+        // Should contain two border chars
+        assert_eq!(s.matches('│').count(), 2);
+        // Should restore cursor
+        assert!(s.contains("\x1b8"));
     }
 }
