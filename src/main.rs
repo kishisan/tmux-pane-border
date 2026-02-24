@@ -7,10 +7,23 @@ mod vt_filter;
 use clap::Parser;
 use config::Config;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::sys::termios::Termios;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::process::Command;
+
+/// RAII guard that restores terminal settings on drop (including panic).
+struct RawModeGuard {
+    fd: RawFd,
+    orig: Termios,
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = pty::restore_terminal(self.fd, &self.orig);
+    }
+}
 
 /// A PTY wrapper that draws a colored border around the pane content.
 #[derive(Parser, Debug)]
@@ -78,8 +91,9 @@ fn run(
     let child = pty::spawn_child(inner_cols, inner_rows, command, args)?;
     let master_raw = child.master_fd.as_raw_fd();
 
-    // Enter raw mode on outer terminal
+    // Enter raw mode on outer terminal (guard ensures restore on panic)
     let orig_termios = pty::enter_raw_mode(stdin_fd)?;
+    let _raw_guard = RawModeGuard { fd: stdin_fd, orig: orig_termios.clone() };
 
     // Set up signal handling
     let (sig_flags, signals) = signal::SignalFlags::register()?;

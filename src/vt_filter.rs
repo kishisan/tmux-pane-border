@@ -45,6 +45,11 @@ pub struct FilterState {
     /// Tracked cursor row in inner coordinates (1-based).
     /// Used for ED 0J/1J to only erase the correct range of rows.
     cursor_row: u16,
+    /// Top of scroll region in inner coordinates (1-based). Default = 1.
+    scroll_top: u16,
+    /// Bottom of scroll region in inner coordinates (1-based). Default = inner_height.
+    /// Stored as 0 to mean "use inner_height" (since we don't know it at construction).
+    scroll_bottom: u16,
 }
 
 impl FilterState {
@@ -53,12 +58,26 @@ impl FilterState {
             parser: ParserState::Ground,
             needs_border_redraw: false,
             cursor_row: 1,
+            scroll_top: 1,
+            scroll_bottom: 0, // 0 means "full screen" (resolved at use site)
         }
     }
 
-    /// Reset cursor_row to 1 (e.g. after SIGWINCH resize).
+    /// Reset cursor_row and scroll region to defaults (e.g. after SIGWINCH resize).
     pub fn reset_cursor_row(&mut self) {
         self.cursor_row = 1;
+        self.reset_scroll_region();
+    }
+
+    /// Reset scroll region to full screen.
+    fn reset_scroll_region(&mut self) {
+        self.scroll_top = 1;
+        self.scroll_bottom = 0;
+    }
+
+    /// Get effective scroll bottom, resolving 0 to inner_height.
+    fn effective_scroll_bottom(&self, inner_height: u16) -> u16 {
+        if self.scroll_bottom == 0 { inner_height } else { self.scroll_bottom }
     }
 
     /// Check and clear the needs_border_redraw flag.
@@ -101,25 +120,26 @@ pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16, bo
                     // Convert to CHA column 2 (inner left edge) instead.
                     output.extend_from_slice(b"\x1b[2G");
                 } else if byte == 0x0A {
-                    // LF: pass through, then repair bottom row side borders.
-                    // When cursor is on the scroll region bottom row, LF triggers
-                    // a scroll that shifts side border characters up, leaving the
-                    // new bottom row without borders.
+                    // LF: pass through. Only repair borders when scroll actually occurs
+                    // (cursor at bottom of scroll region).
                     output.push(byte);
-                    // Track cursor row: LF moves down (clamped to inner_height)
-                    if state.cursor_row < inner_height {
+                    let scroll_bottom = state.effective_scroll_bottom(inner_height);
+                    if state.cursor_row >= scroll_bottom {
+                        // Scroll occurred — repair bottom row side borders
+                        let v = border_info.vertical_char;
+                        let color = border_info.color_seq;
+                        let fg_reset = "\x1b[39m";
+                        let repair_row = scroll_bottom + 1; // outer coordinate
+                        let mut repair = String::new();
+                        let _ = write!(
+                            repair,
+                            "\x1b[?2026h\x1b7\x1b[{repair_row};1H{color}{v}{fg_reset}\x1b[{repair_row};{outer_width}H{color}{v}{fg_reset}\x1b8\x1b[?2026l",
+                        );
+                        output.extend_from_slice(repair.as_bytes());
+                    } else {
+                        // No scroll — just move cursor down
                         state.cursor_row += 1;
                     }
-                    let v = border_info.vertical_char;
-                    let color = border_info.color_seq;
-                    let reset = "\x1b[0m";
-                    let bottom_row = outer_height - 1;
-                    let mut repair = String::new();
-                    let _ = write!(
-                        repair,
-                        "\x1b[s\x1b[{bottom_row};1H{color}{v}{reset}\x1b[{bottom_row};{outer_width}H{color}{v}{reset}\x1b[u",
-                    );
-                    output.extend_from_slice(repair.as_bytes());
                 } else {
                     output.push(byte);
                 }
@@ -140,26 +160,26 @@ pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16, bo
                         state.parser = ParserState::Dcs;
                     }
                     b'M' => {
-                        // Reverse Index: pass through, then repair top scroll row side borders.
-                        // When cursor is on the scroll region top row, ESC M triggers
-                        // a reverse scroll that shifts side border characters down, leaving
-                        // the new top row without borders.
+                        // Reverse Index: pass through. Only repair borders when
+                        // reverse scroll actually occurs (cursor at top of scroll region).
                         output.push(0x1B);
                         output.push(byte);
-                        // Track cursor row: RI moves up (clamped to 1)
-                        if state.cursor_row > 1 {
+                        if state.cursor_row <= state.scroll_top {
+                            // Reverse scroll occurred — repair top row side borders
+                            let v = border_info.vertical_char;
+                            let color = border_info.color_seq;
+                            let fg_reset = "\x1b[39m";
+                            let repair_row = state.scroll_top + 1; // outer coordinate
+                            let mut repair = String::new();
+                            let _ = write!(
+                                repair,
+                                "\x1b[?2026h\x1b7\x1b[{repair_row};1H{color}{v}{fg_reset}\x1b[{repair_row};{outer_width}H{color}{v}{fg_reset}\x1b8\x1b[?2026l",
+                            );
+                            output.extend_from_slice(repair.as_bytes());
+                        } else {
+                            // No scroll — just move cursor up
                             state.cursor_row -= 1;
                         }
-                        let v = border_info.vertical_char;
-                        let color = border_info.color_seq;
-                        let reset = "\x1b[0m";
-                        let top_row = 2u16;
-                        let mut repair = String::new();
-                        let _ = write!(
-                            repair,
-                            "\x1b[s\x1b[{top_row};1H{color}{v}{reset}\x1b[{top_row};{outer_width}H{color}{v}{reset}\x1b[u",
-                        );
-                        output.extend_from_slice(repair.as_bytes());
                         state.parser = ParserState::Ground;
                     }
                     b'c' => {
@@ -168,6 +188,7 @@ pub fn filter_child_output(input: &[u8], outer_width: u16, outer_height: u16, bo
                         output.push(byte);
                         state.needs_border_redraw = true;
                         state.cursor_row = 1;
+                        state.reset_scroll_region();
                         state.parser = ParserState::Ground;
                     }
                     _ => {
@@ -309,6 +330,8 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
             // DECSTBM: CSI top ; bottom r
             let top = nums.first().copied().unwrap_or(1).max(1);
             let bottom = nums.get(1).copied().unwrap_or(inner_height).min(inner_height);
+            state.scroll_top = top;
+            state.scroll_bottom = bottom;
             let new_top = top + 1;
             let new_bottom = bottom + 1;
             let _ = write!(result, "\x1b[{new_top};{new_bottom}r");
@@ -318,27 +341,39 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
             let mode = nums.first().copied().unwrap_or(0);
             match mode {
                 0 => {
-                    // Erase from cursor to end: use tracked cursor_row to only
-                    // erase from the current row downward.
+                    // Erase from cursor to end: clear remainder of cursor line,
+                    // then erase all rows below.
                     let start_row = state.cursor_row.max(1);
+                    let v = border_info.vertical_char;
+                    let color = border_info.color_seq;
+                    let fg_reset = "\x1b[39m";
                     let _ = write!(result, "\x1b[?2026h"); // begin synchronized output
-                    let _ = write!(result, "\x1b[s"); // save cursor
-                    for row in (start_row + 1)..=(inner_height + 1) {
+                    // Erase cursor line from cursor to end + repair right border
+                    let _ = write!(result, "\x1b[K\x1b7\x1b[{outer_width}G{color}{v}{fg_reset}\x1b8");
+                    // Erase all rows below cursor line
+                    let _ = write!(result, "\x1b7"); // save cursor
+                    for row in (start_row + 1 + 1)..=(inner_height + 1) {
                         let _ = write!(result, "\x1b[{row};2H\x1b[{}X", inner_width);
                     }
-                    let _ = write!(result, "\x1b[u"); // restore cursor
+                    let _ = write!(result, "\x1b8"); // restore cursor
                     let _ = write!(result, "\x1b[?2026l"); // end synchronized output
                 }
                 1 => {
-                    // Erase from beginning to cursor: use tracked cursor_row to only
-                    // erase from the top down to the current row.
+                    // Erase from beginning to cursor: erase full rows above
+                    // cursor line, then erase cursor line from start to cursor.
                     let end_row = state.cursor_row.min(inner_height);
+                    let v = border_info.vertical_char;
+                    let color = border_info.color_seq;
+                    let fg_reset = "\x1b[39m";
                     let _ = write!(result, "\x1b[?2026h"); // begin synchronized output
-                    let _ = write!(result, "\x1b[s"); // save cursor
-                    for row in 2..=(end_row + 1) {
+                    let _ = write!(result, "\x1b7"); // save cursor
+                    // Erase all rows above the cursor line
+                    for row in 2..=(end_row) {
                         let _ = write!(result, "\x1b[{row};2H\x1b[{}X", inner_width);
                     }
-                    let _ = write!(result, "\x1b[u"); // restore cursor
+                    let _ = write!(result, "\x1b8"); // restore cursor
+                    // Erase cursor line from start to cursor + repair left border
+                    let _ = write!(result, "\x1b[1K\x1b7\x1b[1G{color}{v}{fg_reset}\x1b8");
                     let _ = write!(result, "\x1b[?2026l"); // end synchronized output
                 }
                 2 | 3 => {
@@ -352,6 +387,7 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
                     let _ = write!(result, "\x1b[2;2H");
                     let _ = write!(result, "\x1b[?2026l"); // end synchronized output
                     state.cursor_row = 1;
+                    state.reset_scroll_region();
                     state.needs_border_redraw = true;
                 }
                 _ => {
@@ -364,23 +400,23 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
             let mode = nums.first().copied().unwrap_or(0);
             let v = border_info.vertical_char;
             let color = border_info.color_seq;
-            let reset = "\x1b[0m";
+            let reset = "\x1b[39m";
             match mode {
                 0 => {
                     // BUG 2 fix: Erase from cursor to end of line.
                     // Pass through CSI K (terminal handles the erase correctly),
                     // then redraw right border character which gets erased.
-                    let _ = write!(result, "\x1b[K\x1b[s\x1b[{outer_width}G{color}{v}{reset}\x1b[u");
+                    let _ = write!(result, "\x1b[K\x1b7\x1b[{outer_width}G{color}{v}{reset}\x1b8");
                 }
                 1 => {
                     // BUG 4 fix: Erase from beginning of line to cursor.
                     // CSI 1K erases from column 1, destroying left border.
                     // Pass through then redraw left border character.
-                    let _ = write!(result, "\x1b[1K\x1b[s\x1b[1G{color}{v}{reset}\x1b[u");
+                    let _ = write!(result, "\x1b[1K\x1b7\x1b[1G{color}{v}{reset}\x1b8");
                 }
                 2 => {
                     // Erase entire line: pass through, then redraw both borders.
-                    let _ = write!(result, "\x1b[2K\x1b[s\x1b[1G{color}{v}{reset}\x1b[{outer_width}G{color}{v}{reset}\x1b[u");
+                    let _ = write!(result, "\x1b[2K\x1b7\x1b[1G{color}{v}{reset}\x1b[{outer_width}G{color}{v}{reset}\x1b8");
                 }
                 _ => {
                     let param_str = std::str::from_utf8(params).unwrap_or("");
@@ -434,6 +470,7 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
                 if param_str == "1049" || param_str == "47" {
                     state.needs_border_redraw = true;
                     state.cursor_row = 1;
+                    state.reset_scroll_region();
                 }
             }
         }
@@ -501,13 +538,13 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
 fn repair_all_side_borders(result: &mut String, outer_width: u16, inner_height: u16, border_info: &BorderInfo) {
     let v = border_info.vertical_char;
     let color = border_info.color_seq;
-    let reset = "\x1b[0m";
+    let reset = "\x1b[39m";
     let _ = write!(result, "\x1b[?2026h"); // begin synchronized output
-    let _ = write!(result, "\x1b[s"); // save cursor
+    let _ = write!(result, "\x1b7"); // save cursor
     for row in 2..=(inner_height + 1) {
         let _ = write!(result, "\x1b[{row};1H{color}{v}{reset}\x1b[{row};{outer_width}H{color}{v}{reset}");
     }
-    let _ = write!(result, "\x1b[u"); // restore cursor
+    let _ = write!(result, "\x1b8"); // restore cursor
     let _ = write!(result, "\x1b[?2026l"); // end synchronized output
 }
 
@@ -515,14 +552,14 @@ fn repair_all_side_borders(result: &mut String, outer_width: u16, inner_height: 
 fn repair_bottom_side_borders(result: &mut String, outer_width: u16, inner_height: u16, count: u16, border_info: &BorderInfo) {
     let v = border_info.vertical_char;
     let color = border_info.color_seq;
-    let reset = "\x1b[0m";
+    let reset = "\x1b[39m";
     let _ = write!(result, "\x1b[?2026h");
-    let _ = write!(result, "\x1b[s");
+    let _ = write!(result, "\x1b7");
     let first = (inner_height + 1).saturating_sub(count.saturating_sub(1)).max(2);
     for row in first..=(inner_height + 1) {
         let _ = write!(result, "\x1b[{row};1H{color}{v}{reset}\x1b[{row};{outer_width}H{color}{v}{reset}");
     }
-    let _ = write!(result, "\x1b[u");
+    let _ = write!(result, "\x1b8");
     let _ = write!(result, "\x1b[?2026l");
 }
 
@@ -530,13 +567,13 @@ fn repair_bottom_side_borders(result: &mut String, outer_width: u16, inner_heigh
 fn repair_top_side_borders(result: &mut String, outer_width: u16, inner_height: u16, count: u16, border_info: &BorderInfo) {
     let v = border_info.vertical_char;
     let color = border_info.color_seq;
-    let reset = "\x1b[0m";
+    let reset = "\x1b[39m";
     let _ = write!(result, "\x1b[?2026h");
-    let _ = write!(result, "\x1b[s");
+    let _ = write!(result, "\x1b7");
     for row in 2..=(count.saturating_add(1).min(inner_height + 1)) {
         let _ = write!(result, "\x1b[{row};1H{color}{v}{reset}\x1b[{row};{outer_width}H{color}{v}{reset}");
     }
-    let _ = write!(result, "\x1b[u");
+    let _ = write!(result, "\x1b8");
     let _ = write!(result, "\x1b[?2026l");
 }
 
@@ -544,8 +581,8 @@ fn repair_top_side_borders(result: &mut String, outer_width: u16, inner_height: 
 fn repair_right_border_current_row(result: &mut String, outer_width: u16, border_info: &BorderInfo) {
     let v = border_info.vertical_char;
     let color = border_info.color_seq;
-    let reset = "\x1b[0m";
-    let _ = write!(result, "\x1b[s\x1b[{outer_width}G{color}{v}{reset}\x1b[u");
+    let reset = "\x1b[39m";
+    let _ = write!(result, "\x1b7\x1b[{outer_width}G{color}{v}{reset}\x1b8");
 }
 
 /// Transform SGR mouse sequence coordinates.
@@ -729,9 +766,9 @@ mod tests {
     #[test]
     fn test_sgr_passthrough() {
         // Color sequences should pass through
-        let input = b"\x1b[31mred\x1b[0m";
+        let input = b"\x1b[31mred\x1b[39m";
         let output = filter(input, 80, 24, &mut FilterState::new());
-        assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[31mred\x1b[0m");
+        assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[31mred\x1b[39m");
     }
 
     #[test]
@@ -830,17 +867,31 @@ mod tests {
 
     #[test]
     fn test_newline_with_cr() {
-        // \r should become CHA(2), \n should pass through + border repair
+        // \r should become CHA(2), \n should pass through
+        // At cursor_row=1 (not at scroll bottom), no repair occurs
         let input = b"\r\n";
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
         // Starts with CR->CHA(2) then LF
         assert!(s.starts_with("\x1b[2G\n"));
-        // LF triggers border repair using CSI s/u
-        assert!(s.contains("\x1b[s"));
+        // No repair at cursor_row=1 (not at scroll bottom)
+        assert!(!s.contains('│'));
+    }
+
+    #[test]
+    fn test_newline_at_scroll_bottom_repairs() {
+        // LF at scroll bottom should trigger repair
+        let mut state = FilterState::new();
+        let bi = test_border_info();
+        // Move cursor to bottom of scroll region (inner_height = 22)
+        let _ = filter_child_output(b"\x1b[22;1H", 80, 24, &bi, &mut state);
+        let output = filter_child_output(b"\r\n", 80, 24, &bi, &mut state);
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.contains("\x1b7"));
         assert!(s.contains("\x1b[23;1H"));
         assert!(s.contains("\x1b[23;80H"));
-        assert!(s.contains("\x1b[u"));
+        assert!(s.contains("\x1b8"));
+        assert_eq!(s.matches('│').count(), 2);
     }
 
     #[test]
@@ -868,11 +919,11 @@ mod tests {
         // Should contain the EL sequence
         assert!(s.starts_with("\x1b[K"));
         // Should contain save cursor (CSI s), move to column 80, draw border char, reset, restore cursor (CSI u)
-        assert!(s.contains("\x1b[s"));
+        assert!(s.contains("\x1b7"));
         assert!(s.contains("\x1b[80G"));
         assert!(s.contains('│'));
-        assert!(s.contains("\x1b[0m"));
-        assert!(s.contains("\x1b[u"));
+        assert!(s.contains("\x1b[39m"));
+        assert!(s.contains("\x1b8"));
     }
 
     #[test]
@@ -884,11 +935,11 @@ mod tests {
         // Should contain the EL 1K sequence
         assert!(s.starts_with("\x1b[1K"));
         // Should contain save cursor (CSI s), move to column 1, draw border char, reset, restore cursor (CSI u)
-        assert!(s.contains("\x1b[s"));
+        assert!(s.contains("\x1b7"));
         assert!(s.contains("\x1b[1G"));
         assert!(s.contains('│'));
-        assert!(s.contains("\x1b[0m"));
-        assert!(s.contains("\x1b[u"));
+        assert!(s.contains("\x1b[39m"));
+        assert!(s.contains("\x1b8"));
     }
 
     #[test]
@@ -910,24 +961,25 @@ mod tests {
 
     #[test]
     fn test_ed_0j_converts_to_ech_rows() {
-        // ED 0J (erase from cursor to end) should erase from cursor_row downward
-        // with synchronized output wrapping and cursor save/restore (CSI s/u)
+        // ED 0J (erase from cursor to end) should:
+        // 1. Clear cursor line remainder (EL 0K) + repair right border
+        // 2. ECH for all rows below cursor
         let input = b"\x1b[J"; // ED 0J (default)
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
         // Should begin with synchronized output
         assert!(s.starts_with("\x1b[?2026h"));
-        // Should save cursor with CSI s
-        assert!(s.contains("\x1b[s"));
-        // cursor_row defaults to 1, so ED 0J erases from row 2 (inner row 1+1) to row 23
-        assert!(s.contains("\x1b[2;2H\x1b[78X"));
+        // Should contain EL 0K for cursor line
+        assert!(s.contains("\x1b[K"));
+        // Should repair right border on cursor line
+        assert!(s.contains("\x1b[80G"));
+        // cursor_row defaults to 1, so rows below = row 3 (inner 2+1) to row 23
+        assert!(s.contains("\x1b[3;2H\x1b[78X"));
         assert!(s.contains("\x1b[23;2H\x1b[78X"));
-        // Should restore cursor with CSI u and end synchronized output
-        assert!(s.contains("\x1b[u"));
+        // Should use DECSC/DECRC
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b8"));
         assert!(s.ends_with("\x1b[?2026l"));
-        // Should NOT contain raw ED sequence
-        assert!(!s.contains("\x1b[J\x1b"));
-        assert!(!s.contains("\x1b[0J"));
     }
 
     #[test]
@@ -937,14 +989,16 @@ mod tests {
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
         assert!(s.starts_with("\x1b[?2026h"));
-        assert!(s.contains("\x1b[s"));
-        assert!(s.contains("\x1b[2;2H\x1b[78X"));
+        // Should contain EL 0K for cursor line
+        assert!(s.contains("\x1b[K"));
+        assert!(s.contains("\x1b[3;2H\x1b[78X"));
         assert!(s.ends_with("\x1b[?2026l"));
     }
 
     #[test]
     fn test_ed_0j_with_cursor_position() {
-        // ED 0J after moving cursor to row 10 should only erase rows 10..=22
+        // ED 0J after moving cursor to row 10 should clear cursor line (EL 0K)
+        // + ECH for rows 11..=22 (outer 12..=23)
         let mut state = FilterState::new();
         let bi = test_border_info();
         // Move cursor to row 10
@@ -952,33 +1006,39 @@ mod tests {
         // Now ED 0J
         let output = filter_child_output(b"\x1b[J", 80, 24, &bi, &mut state);
         let s = std::str::from_utf8(&output).unwrap();
-        // Should NOT erase rows 2..9 (inner rows 1..8, outer rows 2..9)
+        // Should contain EL 0K for cursor line
+        assert!(s.contains("\x1b[K"));
+        // Should NOT erase rows 2..10 (before cursor)
         assert!(!s.contains("\x1b[2;2H"));
-        assert!(!s.contains("\x1b[9;2H"));
-        // Should erase from row 11 (inner row 10 + 1) to row 23
-        assert!(s.contains("\x1b[11;2H\x1b[78X"));
+        assert!(!s.contains("\x1b[10;2H"));
+        // Should erase from row 12 (inner row 11 + 1) to row 23
+        assert!(s.contains("\x1b[12;2H\x1b[78X"));
         assert!(s.contains("\x1b[23;2H\x1b[78X"));
     }
 
     #[test]
     fn test_ed_1j_converts_to_ech_rows() {
         // ED 1J (erase from beginning to cursor) with default cursor_row=1
-        // should erase only row 2 (inner row 1 + 1)
+        // should: no rows above (loop 2..=1 is empty), then EL 1K + left border repair
         let input = b"\x1b[1J";
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
         assert!(s.starts_with("\x1b[?2026h"));
-        assert!(s.contains("\x1b[s"));
-        assert!(s.contains("\x1b[2;2H\x1b[78X"));
-        // Should NOT erase beyond cursor_row=1 (outer row 2)
-        assert!(!s.contains("\x1b[3;2H"));
-        assert!(s.contains("\x1b[u"));
+        assert!(s.contains("\x1b7"));
+        // No ECH rows (cursor at row 1, no rows above)
+        assert!(!s.contains("\x1b[2;2H\x1b[78X"));
+        // Should contain EL 1K for cursor line
+        assert!(s.contains("\x1b[1K"));
+        // Should repair left border
+        assert!(s.contains("\x1b[1G"));
+        assert!(s.contains("\x1b8"));
         assert!(s.ends_with("\x1b[?2026l"));
     }
 
     #[test]
     fn test_ed_1j_with_cursor_position() {
-        // ED 1J after moving cursor to row 10 should only erase rows 1..=10
+        // ED 1J after moving cursor to row 10 should:
+        // ECH for rows 1..=9 (outer 2..=10), then EL 1K + left border on cursor line
         let mut state = FilterState::new();
         let bi = test_border_info();
         // Move cursor to row 10
@@ -986,9 +1046,13 @@ mod tests {
         // Now ED 1J
         let output = filter_child_output(b"\x1b[1J", 80, 24, &bi, &mut state);
         let s = std::str::from_utf8(&output).unwrap();
-        // Should erase rows 2..=11 (inner rows 1..=10, outer rows 2..=11)
+        // Should erase rows 2..=10 (inner rows 1..=9, outer rows 2..=10) with ECH
         assert!(s.contains("\x1b[2;2H\x1b[78X"));
-        assert!(s.contains("\x1b[11;2H\x1b[78X"));
+        assert!(s.contains("\x1b[10;2H\x1b[78X"));
+        // Should NOT erase row 11 with ECH (that's cursor line — uses EL 1K instead)
+        assert!(!s.contains("\x1b[11;2H\x1b[78X"));
+        // Should contain EL 1K for cursor line
+        assert!(s.contains("\x1b[1K"));
         // Should NOT erase row 12 (inner row 11)
         assert!(!s.contains("\x1b[12;2H"));
     }
@@ -1019,33 +1083,43 @@ mod tests {
     }
 
     #[test]
-    fn test_lf_repairs_bottom_border() {
-        // LF should pass through and append bottom-row border repair
+    fn test_lf_no_repair_when_not_at_scroll_bottom() {
+        // LF at cursor_row=1 (not at scroll bottom) should NOT repair borders
         let input = b"\n";
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
         // Should start with the LF itself
         assert!(s.starts_with('\n'));
-        // Should save cursor with CSI s
-        assert!(s.contains("\x1b[s"));
-        // Should draw left border at bottom row (row 23), col 1
-        assert!(s.contains("\x1b[23;1H"));
-        // Should draw right border at bottom row, col 80
-        assert!(s.contains("\x1b[23;80H"));
-        // Should contain two border chars
-        assert_eq!(s.matches('│').count(), 2);
-        // Should restore cursor with CSI u
-        assert!(s.contains("\x1b[u"));
+        // No border repair
+        assert_eq!(s.matches('│').count(), 0);
+        assert_eq!(s, "\n");
     }
 
     #[test]
-    fn test_lf_in_text_stream() {
-        // Multiple LFs in text should each get border repair
+    fn test_lf_repairs_at_scroll_bottom() {
+        // LF at scroll bottom should trigger border repair
+        let mut state = FilterState::new();
+        let bi = test_border_info();
+        // Move cursor to inner_height (22)
+        let _ = filter_child_output(b"\x1b[22;1H", 80, 24, &bi, &mut state);
+        let output = filter_child_output(b"\n", 80, 24, &bi, &mut state);
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with('\n'));
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b[23;1H"));
+        assert!(s.contains("\x1b[23;80H"));
+        assert_eq!(s.matches('│').count(), 2);
+        assert!(s.contains("\x1b8"));
+    }
+
+    #[test]
+    fn test_lf_in_text_stream_no_repair_until_bottom() {
+        // Multiple LFs in text from cursor_row=1 should not get border repair
+        // (cursor moves from 1 to 3, never reaches scroll bottom 22)
         let input = b"a\nb\n";
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
-        // Should have 2 LFs and thus 4 border chars (2 per LF)
-        assert_eq!(s.matches('│').count(), 4);
+        assert_eq!(s.matches('│').count(), 0);
     }
 
     #[test]
@@ -1057,7 +1131,7 @@ mod tests {
         // Should start with ESC M
         assert!(s.starts_with("\x1bM"));
         // Should save cursor with CSI s
-        assert!(s.contains("\x1b[s"));
+        assert!(s.contains("\x1b7"));
         // Should draw left border at top row (row 2), col 1
         assert!(s.contains("\x1b[2;1H"));
         // Should draw right border at top row, col 80
@@ -1065,7 +1139,7 @@ mod tests {
         // Should contain two border chars
         assert_eq!(s.matches('│').count(), 2);
         // Should restore cursor with CSI u
-        assert!(s.contains("\x1b[u"));
+        assert!(s.contains("\x1b8"));
     }
 
     // === IL/DL/SU/SD/ICH/DCH/ECH/DECLRMM tests ===
@@ -1080,8 +1154,8 @@ mod tests {
         assert!(s.starts_with("\x1b[3L"));
         // Should use synchronized output and CSI s/u
         assert!(s.contains("\x1b[?2026h"));
-        assert!(s.contains("\x1b[s"));
-        assert!(s.contains("\x1b[u"));
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b8"));
         assert!(s.contains("\x1b[?2026l"));
         // Should repair all 22 inner rows (rows 2..=23), 2 borders each = 44
         assert_eq!(s.matches('│').count(), 44);
@@ -1099,8 +1173,8 @@ mod tests {
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
         assert!(s.starts_with("\x1b[2M"));
-        assert!(s.contains("\x1b[s"));
-        assert!(s.contains("\x1b[u"));
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b8"));
         assert_eq!(s.matches('│').count(), 44);
     }
 
@@ -1121,8 +1195,8 @@ mod tests {
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
         assert!(s.starts_with("\x1b[3S"));
-        assert!(s.contains("\x1b[s"));
-        assert!(s.contains("\x1b[u"));
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b8"));
         // 3 rows × 2 borders = 6
         assert_eq!(s.matches('│').count(), 6);
         // Should repair rows 21, 22, 23 (bottom 3 of inner area)
@@ -1151,8 +1225,8 @@ mod tests {
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
         assert!(s.starts_with("\x1b[3T"));
-        assert!(s.contains("\x1b[s"));
-        assert!(s.contains("\x1b[u"));
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b8"));
         // 3 rows × 2 borders = 6
         assert_eq!(s.matches('│').count(), 6);
         // Should repair rows 2, 3, 4 (top 3 of inner area)
@@ -1181,10 +1255,10 @@ mod tests {
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
         assert!(s.starts_with("\x1b[5@"));
-        assert!(s.contains("\x1b[s"));
+        assert!(s.contains("\x1b7"));
         assert!(s.contains("\x1b[80G"));
         assert_eq!(s.matches('│').count(), 1);
-        assert!(s.contains("\x1b[u"));
+        assert!(s.contains("\x1b8"));
     }
 
     #[test]
@@ -1194,10 +1268,10 @@ mod tests {
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
         assert!(s.starts_with("\x1b[5P"));
-        assert!(s.contains("\x1b[s"));
+        assert!(s.contains("\x1b7"));
         assert!(s.contains("\x1b[80G"));
         assert_eq!(s.matches('│').count(), 1);
-        assert!(s.contains("\x1b[u"));
+        assert!(s.contains("\x1b8"));
     }
 
     #[test]
@@ -1207,10 +1281,10 @@ mod tests {
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
         assert!(s.starts_with("\x1b[20X"));
-        assert!(s.contains("\x1b[s"));
+        assert!(s.contains("\x1b7"));
         assert!(s.contains("\x1b[80G"));
         assert_eq!(s.matches('│').count(), 1);
-        assert!(s.contains("\x1b[u"));
+        assert!(s.contains("\x1b8"));
     }
 
     #[test]
