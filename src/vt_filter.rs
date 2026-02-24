@@ -80,6 +80,12 @@ impl FilterState {
         if self.scroll_bottom == 0 { inner_height } else { self.scroll_bottom }
     }
 
+    /// Get the current scroll region in inner coordinates (1-based).
+    /// Returns (top, bottom) where bottom is resolved to inner_height if unset.
+    pub fn get_scroll_region(&self, inner_height: u16) -> (u16, u16) {
+        (self.scroll_top, self.effective_scroll_bottom(inner_height))
+    }
+
     /// Check and clear the needs_border_redraw flag.
     pub fn take_border_redraw(&mut self) -> bool {
         let v = self.needs_border_redraw;
@@ -350,7 +356,10 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
                     let _ = write!(result, "\x1b[?2026h"); // begin synchronized output
                     // Erase cursor line from cursor to end + repair right border
                     let _ = write!(result, "\x1b[K\x1b7\x1b[{outer_width}G{color}{v}{fg_reset}\x1b8");
-                    // Erase all rows below cursor line
+                    // Erase all rows below cursor line.
+                    // start_row is in inner coordinates. Inner row N maps to outer row N+1.
+                    // We want rows below cursor: inner (start_row+1)..=inner_height
+                    // = outer (start_row+2)..=(inner_height+1).
                     let _ = write!(result, "\x1b7"); // save cursor
                     for row in (start_row + 1 + 1)..=(inner_height + 1) {
                         let _ = write!(result, "\x1b[{row};2H\x1b[{}X", inner_width);
@@ -367,7 +376,9 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
                     let fg_reset = "\x1b[39m";
                     let _ = write!(result, "\x1b[?2026h"); // begin synchronized output
                     let _ = write!(result, "\x1b7"); // save cursor
-                    // Erase all rows above the cursor line
+                    // Erase all rows above the cursor line.
+                    // end_row is in inner coordinates. Inner row N maps to outer row N+1.
+                    // We want rows above cursor: inner 1..=(end_row-1) = outer 2..=end_row.
                     for row in 2..=(end_row) {
                         let _ = write!(result, "\x1b[{row};2H\x1b[{}X", inner_width);
                     }
@@ -387,7 +398,8 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
                     let _ = write!(result, "\x1b[2;2H");
                     let _ = write!(result, "\x1b[?2026l"); // end synchronized output
                     state.cursor_row = 1;
-                    state.reset_scroll_region();
+                    // Note: real terminals do NOT reset scroll region on ED 2J
+                    // (only RIS and DECSTR do). Preserve the tracked scroll region.
                     state.needs_border_redraw = true;
                 }
                 _ => {
@@ -406,17 +418,17 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
                     // BUG 2 fix: Erase from cursor to end of line.
                     // Pass through CSI K (terminal handles the erase correctly),
                     // then redraw right border character which gets erased.
-                    let _ = write!(result, "\x1b[K\x1b7\x1b[{outer_width}G{color}{v}{reset}\x1b8");
+                    let _ = write!(result, "\x1b[?2026h\x1b[K\x1b7\x1b[{outer_width}G{color}{v}{reset}\x1b8\x1b[?2026l");
                 }
                 1 => {
                     // BUG 4 fix: Erase from beginning of line to cursor.
                     // CSI 1K erases from column 1, destroying left border.
                     // Pass through then redraw left border character.
-                    let _ = write!(result, "\x1b[1K\x1b7\x1b[1G{color}{v}{reset}\x1b8");
+                    let _ = write!(result, "\x1b[?2026h\x1b[1K\x1b7\x1b[1G{color}{v}{reset}\x1b8\x1b[?2026l");
                 }
                 2 => {
                     // Erase entire line: pass through, then redraw both borders.
-                    let _ = write!(result, "\x1b[2K\x1b7\x1b[1G{color}{v}{reset}\x1b[{outer_width}G{color}{v}{reset}\x1b8");
+                    let _ = write!(result, "\x1b[?2026h\x1b[2K\x1b7\x1b[1G{color}{v}{reset}\x1b[{outer_width}G{color}{v}{reset}\x1b8\x1b[?2026l");
                 }
                 _ => {
                     let param_str = std::str::from_utf8(params).unwrap_or("");
@@ -596,7 +608,7 @@ fn repair_right_border_current_row(result: &mut String, outer_width: u16, border
     let v = border_info.vertical_char;
     let color = border_info.color_seq;
     let reset = "\x1b[39m";
-    let _ = write!(result, "\x1b7\x1b[{outer_width}G{color}{v}{reset}\x1b8");
+    let _ = write!(result, "\x1b[?2026h\x1b7\x1b[{outer_width}G{color}{v}{reset}\x1b8\x1b[?2026l");
 }
 
 /// Transform SGR mouse sequence coordinates.
@@ -930,9 +942,10 @@ mod tests {
         let input = b"\x1b[K";
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
-        // Should contain the EL sequence
-        assert!(s.starts_with("\x1b[K"));
-        // Should contain save cursor (CSI s), move to column 80, draw border char, reset, restore cursor (CSI u)
+        // Should be wrapped in synchronized output
+        assert!(s.starts_with("\x1b[?2026h\x1b[K"));
+        assert!(s.ends_with("\x1b[?2026l"));
+        // Should contain save cursor, move to column 80, draw border char, reset, restore cursor
         assert!(s.contains("\x1b7"));
         assert!(s.contains("\x1b[80G"));
         assert!(s.contains('│'));
@@ -946,9 +959,10 @@ mod tests {
         let input = b"\x1b[1K";
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
-        // Should contain the EL 1K sequence
-        assert!(s.starts_with("\x1b[1K"));
-        // Should contain save cursor (CSI s), move to column 1, draw border char, reset, restore cursor (CSI u)
+        // Should be wrapped in synchronized output
+        assert!(s.starts_with("\x1b[?2026h\x1b[1K"));
+        assert!(s.ends_with("\x1b[?2026l"));
+        // Should contain save cursor, move to column 1, draw border char, reset, restore cursor
         assert!(s.contains("\x1b7"));
         assert!(s.contains("\x1b[1G"));
         assert!(s.contains('│'));
@@ -962,7 +976,9 @@ mod tests {
         let input = b"\x1b[2K";
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
-        assert!(s.starts_with("\x1b[2K"));
+        // Should be wrapped in synchronized output
+        assert!(s.starts_with("\x1b[?2026h\x1b[2K"));
+        assert!(s.ends_with("\x1b[?2026l"));
         // Should redraw left border at column 1
         assert!(s.contains("\x1b[1G"));
         // Should redraw right border at column 80
@@ -1264,41 +1280,47 @@ mod tests {
 
     #[test]
     fn test_ich_repairs_right_border() {
-        // ICH (CSI 5@) should pass through and repair right border
+        // ICH (CSI 5@) should pass through and repair right border with synchronized output
         let input = b"\x1b[5@";
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
         assert!(s.starts_with("\x1b[5@"));
+        assert!(s.contains("\x1b[?2026h"));
         assert!(s.contains("\x1b7"));
         assert!(s.contains("\x1b[80G"));
         assert_eq!(s.matches('│').count(), 1);
         assert!(s.contains("\x1b8"));
+        assert!(s.ends_with("\x1b[?2026l"));
     }
 
     #[test]
     fn test_dch_repairs_right_border() {
-        // DCH (CSI 5P) should pass through and repair right border
+        // DCH (CSI 5P) should pass through and repair right border with synchronized output
         let input = b"\x1b[5P";
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
         assert!(s.starts_with("\x1b[5P"));
+        assert!(s.contains("\x1b[?2026h"));
         assert!(s.contains("\x1b7"));
         assert!(s.contains("\x1b[80G"));
         assert_eq!(s.matches('│').count(), 1);
         assert!(s.contains("\x1b8"));
+        assert!(s.ends_with("\x1b[?2026l"));
     }
 
     #[test]
     fn test_ech_repairs_right_border() {
-        // ECH (CSI 20X) should pass through and repair right border
+        // ECH (CSI 20X) should pass through and repair right border with synchronized output
         let input = b"\x1b[20X";
         let output = filter(input, 80, 24, &mut FilterState::new());
         let s = std::str::from_utf8(&output).unwrap();
         assert!(s.starts_with("\x1b[20X"));
+        assert!(s.contains("\x1b[?2026h"));
         assert!(s.contains("\x1b7"));
         assert!(s.contains("\x1b[80G"));
         assert_eq!(s.matches('│').count(), 1);
         assert!(s.contains("\x1b8"));
+        assert!(s.ends_with("\x1b[?2026l"));
     }
 
     #[test]
@@ -1416,6 +1438,22 @@ mod tests {
         let bi = test_border_info();
         let _ = filter_child_output(b"\x1b[2J", 80, 24, &bi, &mut state);
         assert!(state.take_border_redraw());
+    }
+
+    #[test]
+    fn test_ed_2j_preserves_scroll_region() {
+        // ED 2J should NOT reset scroll region (only RIS/DECSTR do that).
+        // A child process that sets a custom scroll region then clears the screen
+        // expects the scroll region to remain intact.
+        let mut state = FilterState::new();
+        let bi = test_border_info();
+        // Set a custom scroll region: inner rows 5..15
+        let _ = filter_child_output(b"\x1b[5;15r", 80, 24, &bi, &mut state);
+        assert_eq!(state.get_scroll_region(22), (5, 15));
+        // ED 2J clears the screen but should preserve the scroll region
+        let _ = filter_child_output(b"\x1b[2J", 80, 24, &bi, &mut state);
+        assert!(state.take_border_redraw());
+        assert_eq!(state.get_scroll_region(22), (5, 15));
     }
 
     #[test]

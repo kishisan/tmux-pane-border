@@ -274,10 +274,14 @@ fn run(
                         },
                     );
                     stdout.write_all(border_str.as_bytes()).ok();
-                    // Re-set scroll region (alt screen exit resets it)
-                    let inner_top = 2;
-                    let inner_bottom = cur_outer_rows - 1;
-                    write!(stdout, "\x1b[{inner_top};{inner_bottom}r").ok();
+                    // Restore the scroll region tracked by FilterState.
+                    // This preserves custom scroll regions set by child processes
+                    // (e.g. after ED 2J which does NOT reset scroll region on real terminals).
+                    let inner_height = cur_outer_rows.saturating_sub(2);
+                    let (st, sb) = filter_state.get_scroll_region(inner_height);
+                    let outer_top = st + 1;
+                    let outer_bottom = sb + 1;
+                    write!(stdout, "\x1b[{outer_top};{outer_bottom}r").ok();
                 }
 
                 stdout.flush().ok();
