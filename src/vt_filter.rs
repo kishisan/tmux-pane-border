@@ -317,9 +317,58 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
         b'h' | b'l' if is_private => {
             // Private mode set/reset (e.g., ?1049h for alternate screen, ?25h for cursor)
             let param_str = std::str::from_utf8(&params[1..]).unwrap_or("");
-            let _ = write!(result, "\x1b[?{param_str}{}", final_byte as char);
+            if param_str == "69" {
+                // Block DECLRMM (Left Right Margin Mode) - would break border rendering
+            } else {
+                let _ = write!(result, "\x1b[?{param_str}{}", final_byte as char);
+            }
             // Note: after alternate screen switch, border will be redrawn by main loop
             // We check for ?1049 and ?47 in the main loop
+        }
+        b'L' => {
+            // IL (Insert Lines): pass through, then repair all side borders
+            let param_str = std::str::from_utf8(params).unwrap_or("");
+            let _ = write!(result, "\x1b[{param_str}L");
+            repair_all_side_borders(&mut result, outer_width, inner_height, border_info);
+        }
+        b'M' => {
+            // DL (Delete Lines): pass through, then repair all side borders
+            // Note: SGR mouse (CSI < ...M) is handled above via early return
+            let param_str = std::str::from_utf8(params).unwrap_or("");
+            let _ = write!(result, "\x1b[{param_str}M");
+            repair_all_side_borders(&mut result, outer_width, inner_height, border_info);
+        }
+        b'S' => {
+            // SU (Scroll Up): pass through, then repair bottom side borders
+            let count = nums.first().copied().unwrap_or(1).max(1);
+            let param_str = std::str::from_utf8(params).unwrap_or("");
+            let _ = write!(result, "\x1b[{param_str}S");
+            repair_bottom_side_borders(&mut result, outer_width, inner_height, count, border_info);
+        }
+        b'T' if !is_private => {
+            // SD (Scroll Down): pass through, then repair top side borders
+            let count = nums.first().copied().unwrap_or(1).max(1);
+            let param_str = std::str::from_utf8(params).unwrap_or("");
+            let _ = write!(result, "\x1b[{param_str}T");
+            repair_top_side_borders(&mut result, outer_width, count, border_info);
+        }
+        b'@' => {
+            // ICH (Insert Characters): pass through, then repair right border
+            let param_str = std::str::from_utf8(params).unwrap_or("");
+            let _ = write!(result, "\x1b[{param_str}@");
+            repair_right_border_current_row(&mut result, outer_width, border_info);
+        }
+        b'P' => {
+            // DCH (Delete Characters): pass through, then repair right border
+            let param_str = std::str::from_utf8(params).unwrap_or("");
+            let _ = write!(result, "\x1b[{param_str}P");
+            repair_right_border_current_row(&mut result, outer_width, border_info);
+        }
+        b'X' => {
+            // ECH (Erase Characters): pass through, then repair right border
+            let param_str = std::str::from_utf8(params).unwrap_or("");
+            let _ = write!(result, "\x1b[{param_str}X");
+            repair_right_border_current_row(&mut result, outer_width, border_info);
         }
         _ => {
             // All other CSI sequences - pass through unchanged
@@ -333,6 +382,52 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
     }
 
     result
+}
+
+/// Repair all side borders in the scroll region (for IL/DL).
+/// Redraws left and right `│` on every inner row.
+fn repair_all_side_borders(result: &mut String, outer_width: u16, inner_height: u16, border_info: &BorderInfo) {
+    let v = border_info.vertical_char;
+    let color = border_info.color_seq;
+    let reset = "\x1b[0m";
+    let _ = write!(result, "\x1b7"); // save cursor
+    for row in 2..=(inner_height + 1) {
+        let _ = write!(result, "\x1b[{row};1H{color}{v}{reset}\x1b[{row};{outer_width}H{color}{v}{reset}");
+    }
+    let _ = write!(result, "\x1b8"); // restore cursor
+}
+
+/// Repair bottom `count` rows' side borders (for SU / scroll up).
+fn repair_bottom_side_borders(result: &mut String, outer_width: u16, inner_height: u16, count: u16, border_info: &BorderInfo) {
+    let v = border_info.vertical_char;
+    let color = border_info.color_seq;
+    let reset = "\x1b[0m";
+    let _ = write!(result, "\x1b7");
+    let first = (inner_height + 1).saturating_sub(count.saturating_sub(1));
+    for row in first..=(inner_height + 1) {
+        let _ = write!(result, "\x1b[{row};1H{color}{v}{reset}\x1b[{row};{outer_width}H{color}{v}{reset}");
+    }
+    let _ = write!(result, "\x1b8");
+}
+
+/// Repair top `count` rows' side borders (for SD / scroll down).
+fn repair_top_side_borders(result: &mut String, outer_width: u16, count: u16, border_info: &BorderInfo) {
+    let v = border_info.vertical_char;
+    let color = border_info.color_seq;
+    let reset = "\x1b[0m";
+    let _ = write!(result, "\x1b7");
+    for row in 2..=(count + 1) {
+        let _ = write!(result, "\x1b[{row};1H{color}{v}{reset}\x1b[{row};{outer_width}H{color}{v}{reset}");
+    }
+    let _ = write!(result, "\x1b8");
+}
+
+/// Repair the right border on the current row (for ICH/DCH/ECH).
+fn repair_right_border_current_row(result: &mut String, outer_width: u16, border_info: &BorderInfo) {
+    let v = border_info.vertical_char;
+    let color = border_info.color_seq;
+    let reset = "\x1b[0m";
+    let _ = write!(result, "\x1b7\x1b[{outer_width}G{color}{v}{reset}\x1b8");
 }
 
 /// Transform SGR mouse sequence coordinates.
@@ -843,5 +938,183 @@ mod tests {
         assert_eq!(s.matches('│').count(), 2);
         // Should restore cursor
         assert!(s.contains("\x1b8"));
+    }
+
+    // === IL/DL/SU/SD/ICH/DCH/ECH/DECLRMM tests ===
+
+    #[test]
+    fn test_il_repairs_all_side_borders() {
+        // IL (CSI 3L) should pass through and repair all side borders
+        let input = b"\x1b[3L";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        // Should start with the IL sequence
+        assert!(s.starts_with("\x1b[3L"));
+        // Should save/restore cursor
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b8"));
+        // Should repair all 22 inner rows (rows 2..=23), 2 borders each = 44
+        assert_eq!(s.matches('│').count(), 44);
+        // Check first and last inner rows
+        assert!(s.contains("\x1b[2;1H"));
+        assert!(s.contains("\x1b[2;80H"));
+        assert!(s.contains("\x1b[23;1H"));
+        assert!(s.contains("\x1b[23;80H"));
+    }
+
+    #[test]
+    fn test_dl_repairs_all_side_borders() {
+        // DL (CSI 2M) should pass through and repair all side borders
+        let input = b"\x1b[2M";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with("\x1b[2M"));
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b8"));
+        assert_eq!(s.matches('│').count(), 44);
+    }
+
+    #[test]
+    fn test_dl_default_param() {
+        // DL with no param (CSI M) should default to 1 and still repair
+        let input = b"\x1b[M";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with("\x1b[M"));
+        assert_eq!(s.matches('│').count(), 44);
+    }
+
+    #[test]
+    fn test_su_repairs_bottom_borders() {
+        // SU (CSI 3S) should pass through and repair bottom 3 rows
+        let input = b"\x1b[3S";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with("\x1b[3S"));
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b8"));
+        // 3 rows × 2 borders = 6
+        assert_eq!(s.matches('│').count(), 6);
+        // Should repair rows 21, 22, 23 (bottom 3 of inner area)
+        assert!(s.contains("\x1b[21;1H"));
+        assert!(s.contains("\x1b[23;80H"));
+    }
+
+    #[test]
+    fn test_su_default_param() {
+        // SU with no param defaults to 1
+        let input = b"\x1b[S";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with("\x1b[S"));
+        // 1 row × 2 borders = 2
+        assert_eq!(s.matches('│').count(), 2);
+        // Should repair bottom row (row 23)
+        assert!(s.contains("\x1b[23;1H"));
+        assert!(s.contains("\x1b[23;80H"));
+    }
+
+    #[test]
+    fn test_sd_repairs_top_borders() {
+        // SD (CSI 3T) should pass through and repair top 3 rows
+        let input = b"\x1b[3T";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with("\x1b[3T"));
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b8"));
+        // 3 rows × 2 borders = 6
+        assert_eq!(s.matches('│').count(), 6);
+        // Should repair rows 2, 3, 4 (top 3 of inner area)
+        assert!(s.contains("\x1b[2;1H"));
+        assert!(s.contains("\x1b[4;80H"));
+    }
+
+    #[test]
+    fn test_sd_default_param() {
+        // SD with no param defaults to 1
+        let input = b"\x1b[T";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with("\x1b[T"));
+        // 1 row × 2 borders = 2
+        assert_eq!(s.matches('│').count(), 2);
+        // Should repair top row (row 2)
+        assert!(s.contains("\x1b[2;1H"));
+        assert!(s.contains("\x1b[2;80H"));
+    }
+
+    #[test]
+    fn test_ich_repairs_right_border() {
+        // ICH (CSI 5@) should pass through and repair right border
+        let input = b"\x1b[5@";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with("\x1b[5@"));
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b[80G"));
+        assert_eq!(s.matches('│').count(), 1);
+        assert!(s.contains("\x1b8"));
+    }
+
+    #[test]
+    fn test_dch_repairs_right_border() {
+        // DCH (CSI 5P) should pass through and repair right border
+        let input = b"\x1b[5P";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with("\x1b[5P"));
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b[80G"));
+        assert_eq!(s.matches('│').count(), 1);
+        assert!(s.contains("\x1b8"));
+    }
+
+    #[test]
+    fn test_ech_repairs_right_border() {
+        // ECH (CSI 20X) should pass through and repair right border
+        let input = b"\x1b[20X";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with("\x1b[20X"));
+        assert!(s.contains("\x1b7"));
+        assert!(s.contains("\x1b[80G"));
+        assert_eq!(s.matches('│').count(), 1);
+        assert!(s.contains("\x1b8"));
+    }
+
+    #[test]
+    fn test_declrmm_blocked() {
+        // CSI ?69h (DECLRMM enable) should be silently dropped
+        let input = b"\x1b[?69h";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        assert_eq!(output, b"");
+    }
+
+    #[test]
+    fn test_declrmm_disable_blocked() {
+        // CSI ?69l (DECLRMM disable) should also be silently dropped
+        let input = b"\x1b[?69l";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        assert_eq!(output, b"");
+    }
+
+    #[test]
+    fn test_other_private_modes_pass_through() {
+        // Other private modes like ?25h (show cursor) should still pass through
+        let input = b"\x1b[?25h";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        assert_eq!(std::str::from_utf8(&output).unwrap(), "\x1b[?25h");
+    }
+
+    #[test]
+    fn test_private_sd_passes_through() {
+        // CSI ? ... T (private T) should pass through unchanged, not be treated as SD
+        let input = b"\x1b[?1T";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert_eq!(s, "\x1b[?1T");
+        // Should NOT contain border repair
+        assert!(!s.contains('│'));
     }
 }
