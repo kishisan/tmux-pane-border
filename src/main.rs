@@ -226,12 +226,6 @@ fn run(
 
                 let raw_output = &child_buf[..n];
 
-                // Check for alternate screen transitions
-                let needs_border_redraw = vt_filter::has_alt_screen_enter(raw_output)
-                    || vt_filter::has_alt_screen_leave(raw_output)
-                    || has_full_clear(raw_output)
-                    || has_ris(raw_output);
-
                 // Build border info for the VT filter (needed for border repair)
                 let active_color_str = if is_active {
                     &config.border.active_color
@@ -250,8 +244,8 @@ fn run(
 
                 stdout.write_all(&filtered).ok();
 
-                // Redraw border if needed (after alt screen switch or full clear)
-                if needs_border_redraw {
+                // Redraw border if needed (alt screen switch, full clear, or RIS detected by state machine)
+                if filter_state.take_border_redraw() {
                     let border_str = border::render_border(
                         cur_outer_cols,
                         cur_outer_rows,
@@ -341,23 +335,3 @@ fn is_mouse_sequence(input: &[u8]) -> bool {
     false
 }
 
-/// Check if the output contains a screen erase (ED) that may damage borders.
-/// Only matches CSI 2J and CSI 3J; ED 0J/1J/J are handled by the VT filter
-/// which converts them to row-by-row ECH to protect borders.
-///
-/// Note: the VT filter already converts ED 2J/3J to safe ECH sequences, so
-/// this detection is technically redundant for normal child output. However,
-/// it serves as a safety net for full-screen application transitions (e.g.,
-/// vim startup/exit) where the border frame needs a full redraw.
-fn has_full_clear(data: &[u8]) -> bool {
-    data.windows(4)
-        .any(|w| w == b"\x1b[2J" || w == b"\x1b[3J")
-}
-
-/// Check if the output contains a RIS (Reset Initial State, ESC c) sequence.
-/// RIS resets the entire terminal: clears the screen, resets scroll regions
-/// and all modes. Triggered by the `reset` command. We need to redraw the
-/// border and re-establish the scroll region afterwards.
-fn has_ris(data: &[u8]) -> bool {
-    data.windows(2).any(|w| w == b"\x1bc")
-}
