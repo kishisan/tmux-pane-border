@@ -56,6 +56,11 @@ impl FilterState {
         }
     }
 
+    /// Reset cursor_row to 1 (e.g. after SIGWINCH resize).
+    pub fn reset_cursor_row(&mut self) {
+        self.cursor_row = 1;
+    }
+
     /// Check and clear the needs_border_redraw flag.
     pub fn take_border_redraw(&mut self) -> bool {
         let v = self.needs_border_redraw;
@@ -457,7 +462,7 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
             let count = nums.first().copied().unwrap_or(1).max(1);
             let param_str = std::str::from_utf8(params).unwrap_or("");
             let _ = write!(result, "\x1b[{param_str}T");
-            repair_top_side_borders(&mut result, outer_width, count, border_info);
+            repair_top_side_borders(&mut result, outer_width, inner_height, count, border_info);
         }
         b'@' => {
             // ICH (Insert Characters): pass through, then repair right border
@@ -513,7 +518,7 @@ fn repair_bottom_side_borders(result: &mut String, outer_width: u16, inner_heigh
     let reset = "\x1b[0m";
     let _ = write!(result, "\x1b[?2026h");
     let _ = write!(result, "\x1b[s");
-    let first = (inner_height + 1).saturating_sub(count.saturating_sub(1));
+    let first = (inner_height + 1).saturating_sub(count.saturating_sub(1)).max(2);
     for row in first..=(inner_height + 1) {
         let _ = write!(result, "\x1b[{row};1H{color}{v}{reset}\x1b[{row};{outer_width}H{color}{v}{reset}");
     }
@@ -522,13 +527,13 @@ fn repair_bottom_side_borders(result: &mut String, outer_width: u16, inner_heigh
 }
 
 /// Repair top `count` rows' side borders (for SD / scroll down).
-fn repair_top_side_borders(result: &mut String, outer_width: u16, count: u16, border_info: &BorderInfo) {
+fn repair_top_side_borders(result: &mut String, outer_width: u16, inner_height: u16, count: u16, border_info: &BorderInfo) {
     let v = border_info.vertical_char;
     let color = border_info.color_seq;
     let reset = "\x1b[0m";
     let _ = write!(result, "\x1b[?2026h");
     let _ = write!(result, "\x1b[s");
-    for row in 2..=(count + 1) {
+    for row in 2..=(count.saturating_add(1).min(inner_height + 1)) {
         let _ = write!(result, "\x1b[{row};1H{color}{v}{reset}\x1b[{row};{outer_width}H{color}{v}{reset}");
     }
     let _ = write!(result, "\x1b[u");
@@ -1446,6 +1451,77 @@ mod tests {
         let _ = filter_child_output(b"\x1b[10;1H", 80, 24, &bi, &mut state);
         assert_eq!(state.cursor_row, 10);
         let _ = filter_child_output(b"\x1bc", 80, 24, &bi, &mut state);
+        assert_eq!(state.cursor_row, 1);
+    }
+
+    // === SU/SD large count clamp tests ===
+
+    #[test]
+    fn test_su_huge_count_does_not_corrupt_top_border() {
+        // CSI 9999S should repair all inner rows but NOT touch row 1 (top border)
+        let input = b"\x1b[9999S";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with("\x1b[9999S"));
+        // Should repair all 22 inner rows (rows 2..=23), clamped by .max(2)
+        assert_eq!(s.matches('│').count(), 44);
+        // Must NOT write to row 1 (top border)
+        assert!(!s.contains("\x1b[1;1H"));
+        assert!(!s.contains("\x1b[1;80H"));
+        // First repaired row should be row 2
+        assert!(s.contains("\x1b[2;1H"));
+    }
+
+    #[test]
+    fn test_su_count_equals_inner_height() {
+        // count == inner_height (22) should repair all inner rows
+        let input = b"\x1b[22S";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert_eq!(s.matches('│').count(), 44);
+        assert!(s.contains("\x1b[2;1H"));
+        assert!(s.contains("\x1b[23;80H"));
+    }
+
+    #[test]
+    fn test_sd_huge_count_does_not_corrupt_bottom_border() {
+        // CSI 9999T should repair all inner rows but NOT touch bottom border row
+        let input = b"\x1b[9999T";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert!(s.starts_with("\x1b[9999T"));
+        // Should repair all 22 inner rows (rows 2..=23), clamped by .min(inner_height+1)
+        assert_eq!(s.matches('│').count(), 44);
+        // Must NOT write to row 24 (bottom border)
+        assert!(!s.contains("\x1b[24;1H"));
+        assert!(!s.contains("\x1b[24;80H"));
+        // Last repaired row should be row 23
+        assert!(s.contains("\x1b[23;1H"));
+        assert!(s.contains("\x1b[23;80H"));
+    }
+
+    #[test]
+    fn test_sd_count_equals_inner_height() {
+        // count == inner_height (22) should repair all inner rows
+        let input = b"\x1b[22T";
+        let output = filter(input, 80, 24, &mut FilterState::new());
+        let s = std::str::from_utf8(&output).unwrap();
+        assert_eq!(s.matches('│').count(), 44);
+        assert!(s.contains("\x1b[2;1H"));
+        assert!(s.contains("\x1b[23;80H"));
+    }
+
+    // === WINCH cursor_row reset test ===
+
+    #[test]
+    fn test_reset_cursor_row() {
+        let mut state = FilterState::new();
+        let bi = test_border_info();
+        // Move cursor to row 20
+        let _ = filter_child_output(b"\x1b[20;1H", 80, 24, &bi, &mut state);
+        assert_eq!(state.cursor_row, 20);
+        // Simulate WINCH: reset cursor_row
+        state.reset_cursor_row();
         assert_eq!(state.cursor_row, 1);
     }
 }

@@ -138,6 +138,9 @@ fn run(
 
                     // Redraw border
                     draw_border_and_setup(cur_outer_cols, cur_outer_rows, is_active, config);
+
+                    // Reset cursor tracking (old position may be out of bounds)
+                    filter_state.reset_cursor_row();
                 }
             }
         }
