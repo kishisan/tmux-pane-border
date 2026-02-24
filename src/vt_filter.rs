@@ -467,7 +467,7 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
             } else {
                 let _ = write!(result, "\x1b[?{param_str}{}", final_byte as char);
                 // Detect alt screen enter/leave: ?1049h/l or ?47h/l
-                if param_str == "1049" || param_str == "47" {
+                if param_str == "1049" || param_str == "1047" || param_str == "47" {
                     state.needs_border_redraw = true;
                     state.cursor_row = 1;
                     state.reset_scroll_region();
@@ -475,31 +475,35 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
             }
         }
         b'L' => {
-            // IL (Insert Lines): pass through, then repair all side borders
+            // IL (Insert Lines): pass through, then repair side borders in scroll region
             let param_str = std::str::from_utf8(params).unwrap_or("");
             let _ = write!(result, "\x1b[{param_str}L");
-            repair_all_side_borders(&mut result, outer_width, inner_height, border_info);
+            let scroll_bottom = state.effective_scroll_bottom(inner_height);
+            repair_side_borders_in_region(&mut result, outer_width, state.scroll_top, scroll_bottom, border_info);
         }
         b'M' => {
-            // DL (Delete Lines): pass through, then repair all side borders
+            // DL (Delete Lines): pass through, then repair side borders in scroll region
             // Note: SGR mouse (CSI < ...M) is handled above via early return
             let param_str = std::str::from_utf8(params).unwrap_or("");
             let _ = write!(result, "\x1b[{param_str}M");
-            repair_all_side_borders(&mut result, outer_width, inner_height, border_info);
+            let scroll_bottom = state.effective_scroll_bottom(inner_height);
+            repair_side_borders_in_region(&mut result, outer_width, state.scroll_top, scroll_bottom, border_info);
         }
         b'S' => {
-            // SU (Scroll Up): pass through, then repair bottom side borders
+            // SU (Scroll Up): pass through, then repair bottom side borders in scroll region
             let count = nums.first().copied().unwrap_or(1).max(1);
             let param_str = std::str::from_utf8(params).unwrap_or("");
             let _ = write!(result, "\x1b[{param_str}S");
-            repair_bottom_side_borders(&mut result, outer_width, inner_height, count, border_info);
+            let scroll_bottom = state.effective_scroll_bottom(inner_height);
+            repair_bottom_side_borders(&mut result, outer_width, state.scroll_top, scroll_bottom, count, border_info);
         }
         b'T' if !is_private => {
-            // SD (Scroll Down): pass through, then repair top side borders
+            // SD (Scroll Down): pass through, then repair top side borders in scroll region
             let count = nums.first().copied().unwrap_or(1).max(1);
             let param_str = std::str::from_utf8(params).unwrap_or("");
             let _ = write!(result, "\x1b[{param_str}T");
-            repair_top_side_borders(&mut result, outer_width, inner_height, count, border_info);
+            let scroll_bottom = state.effective_scroll_bottom(inner_height);
+            repair_top_side_borders(&mut result, outer_width, state.scroll_top, scroll_bottom, count, border_info);
         }
         b'@' => {
             // ICH (Insert Characters): pass through, then repair right border
@@ -533,44 +537,54 @@ fn transform_csi(params: &[u8], final_byte: u8, inner_width: u16, inner_height: 
     result
 }
 
-/// Repair all side borders in the scroll region (for IL/DL).
-/// Redraws left and right `│` on every inner row.
-fn repair_all_side_borders(result: &mut String, outer_width: u16, inner_height: u16, border_info: &BorderInfo) {
+/// Repair side borders within a scroll region range (for IL/DL).
+/// `scroll_top` and `scroll_bottom` are in inner coordinates (1-based).
+/// Redraws left and right `│` on every row in the range.
+fn repair_side_borders_in_region(result: &mut String, outer_width: u16, scroll_top: u16, scroll_bottom: u16, border_info: &BorderInfo) {
     let v = border_info.vertical_char;
     let color = border_info.color_seq;
     let reset = "\x1b[39m";
     let _ = write!(result, "\x1b[?2026h"); // begin synchronized output
     let _ = write!(result, "\x1b7"); // save cursor
-    for row in 2..=(inner_height + 1) {
+    let outer_top = scroll_top + 1;
+    let outer_bottom = scroll_bottom + 1;
+    for row in outer_top..=outer_bottom {
         let _ = write!(result, "\x1b[{row};1H{color}{v}{reset}\x1b[{row};{outer_width}H{color}{v}{reset}");
     }
     let _ = write!(result, "\x1b8"); // restore cursor
     let _ = write!(result, "\x1b[?2026l"); // end synchronized output
 }
 
-/// Repair bottom `count` rows' side borders (for SU / scroll up).
-fn repair_bottom_side_borders(result: &mut String, outer_width: u16, inner_height: u16, count: u16, border_info: &BorderInfo) {
+/// Repair bottom `count` rows' side borders within the scroll region (for SU / scroll up).
+/// `scroll_bottom` is in inner coordinates (1-based).
+fn repair_bottom_side_borders(result: &mut String, outer_width: u16, scroll_top: u16, scroll_bottom: u16, count: u16, border_info: &BorderInfo) {
     let v = border_info.vertical_char;
     let color = border_info.color_seq;
     let reset = "\x1b[39m";
     let _ = write!(result, "\x1b[?2026h");
     let _ = write!(result, "\x1b7");
-    let first = (inner_height + 1).saturating_sub(count.saturating_sub(1)).max(2);
-    for row in first..=(inner_height + 1) {
+    let outer_bottom = scroll_bottom + 1;
+    let outer_top_limit = scroll_top + 1;
+    let first = outer_bottom.saturating_sub(count.saturating_sub(1)).max(outer_top_limit);
+    for row in first..=outer_bottom {
         let _ = write!(result, "\x1b[{row};1H{color}{v}{reset}\x1b[{row};{outer_width}H{color}{v}{reset}");
     }
     let _ = write!(result, "\x1b8");
     let _ = write!(result, "\x1b[?2026l");
 }
 
-/// Repair top `count` rows' side borders (for SD / scroll down).
-fn repair_top_side_borders(result: &mut String, outer_width: u16, inner_height: u16, count: u16, border_info: &BorderInfo) {
+/// Repair top `count` rows' side borders within the scroll region (for SD / scroll down).
+/// `scroll_top` is in inner coordinates (1-based).
+fn repair_top_side_borders(result: &mut String, outer_width: u16, scroll_top: u16, scroll_bottom: u16, count: u16, border_info: &BorderInfo) {
     let v = border_info.vertical_char;
     let color = border_info.color_seq;
     let reset = "\x1b[39m";
     let _ = write!(result, "\x1b[?2026h");
     let _ = write!(result, "\x1b7");
-    for row in 2..=(count.saturating_add(1).min(inner_height + 1)) {
+    let outer_top = scroll_top + 1;
+    let outer_bottom_limit = scroll_bottom + 1;
+    let last = (outer_top + count).saturating_sub(1).min(outer_bottom_limit);
+    for row in outer_top..=last {
         let _ = write!(result, "\x1b[{row};1H{color}{v}{reset}\x1b[{row};{outer_width}H{color}{v}{reset}");
     }
     let _ = write!(result, "\x1b8");
@@ -1351,6 +1365,22 @@ mod tests {
     }
 
     #[test]
+    fn test_alt_screen_1047_sets_redraw_flag() {
+        let mut state = FilterState::new();
+        let bi = test_border_info();
+        let _ = filter_child_output(b"\x1b[?1047h", 80, 24, &bi, &mut state);
+        assert!(state.take_border_redraw());
+    }
+
+    #[test]
+    fn test_alt_screen_1047_leave_sets_redraw_flag() {
+        let mut state = FilterState::new();
+        let bi = test_border_info();
+        let _ = filter_child_output(b"\x1b[?1047l", 80, 24, &bi, &mut state);
+        assert!(state.take_border_redraw());
+    }
+
+    #[test]
     fn test_alt_screen_split_across_buffers() {
         // Alt screen sequence split across two reads should still be detected
         let mut state = FilterState::new();
@@ -1583,6 +1613,77 @@ mod tests {
         assert_eq!(s.matches('│').count(), 44);
         assert!(s.contains("\x1b[2;1H"));
         assert!(s.contains("\x1b[23;80H"));
+    }
+
+    // === Scroll region-aware repair tests (B3/B4) ===
+
+    #[test]
+    fn test_il_with_scroll_region_only_repairs_region() {
+        // Set scroll region to rows 5..=15 (inner), then IL should only repair that region
+        let mut state = FilterState::new();
+        let bi = test_border_info();
+        // Set scroll region: CSI 5;15 r
+        let _ = filter_child_output(b"\x1b[5;15r", 80, 24, &bi, &mut state);
+        // IL
+        let output = filter_child_output(b"\x1b[3L", 80, 24, &bi, &mut state);
+        let s = std::str::from_utf8(&output).unwrap();
+        // Should repair 11 rows (5..=15 inner -> 6..=16 outer), 2 borders each = 22
+        assert_eq!(s.matches('│').count(), 22);
+        // Should repair row 6 (first in region)
+        assert!(s.contains("\x1b[6;1H"));
+        // Should repair row 16 (last in region)
+        assert!(s.contains("\x1b[16;80H"));
+        // Should NOT repair row 2 (outside region)
+        assert!(!s.contains("\x1b[2;1H"));
+        // Should NOT repair row 23 (outside region)
+        assert!(!s.contains("\x1b[23;1H"));
+    }
+
+    #[test]
+    fn test_dl_with_scroll_region_only_repairs_region() {
+        let mut state = FilterState::new();
+        let bi = test_border_info();
+        let _ = filter_child_output(b"\x1b[5;15r", 80, 24, &bi, &mut state);
+        let output = filter_child_output(b"\x1b[2M", 80, 24, &bi, &mut state);
+        let s = std::str::from_utf8(&output).unwrap();
+        assert_eq!(s.matches('│').count(), 22);
+        assert!(s.contains("\x1b[6;1H"));
+        assert!(s.contains("\x1b[16;80H"));
+        assert!(!s.contains("\x1b[2;1H"));
+    }
+
+    #[test]
+    fn test_su_with_scroll_region_only_repairs_region_bottom() {
+        // Set scroll region to rows 5..=15, SU 2 should repair bottom 2 rows of region
+        let mut state = FilterState::new();
+        let bi = test_border_info();
+        let _ = filter_child_output(b"\x1b[5;15r", 80, 24, &bi, &mut state);
+        let output = filter_child_output(b"\x1b[2S", 80, 24, &bi, &mut state);
+        let s = std::str::from_utf8(&output).unwrap();
+        // 2 rows × 2 borders = 4
+        assert_eq!(s.matches('│').count(), 4);
+        // Should repair rows 15 and 16 (outer) = inner 14 and 15
+        assert!(s.contains("\x1b[15;1H"));
+        assert!(s.contains("\x1b[16;80H"));
+        // Should NOT repair row 23 (outside region)
+        assert!(!s.contains("\x1b[23;1H"));
+    }
+
+    #[test]
+    fn test_sd_with_scroll_region_only_repairs_region_top() {
+        // Set scroll region to rows 5..=15, SD 2 should repair top 2 rows of region
+        let mut state = FilterState::new();
+        let bi = test_border_info();
+        let _ = filter_child_output(b"\x1b[5;15r", 80, 24, &bi, &mut state);
+        let output = filter_child_output(b"\x1b[2T", 80, 24, &bi, &mut state);
+        let s = std::str::from_utf8(&output).unwrap();
+        // 2 rows × 2 borders = 4
+        assert_eq!(s.matches('│').count(), 4);
+        // Should repair rows 6 and 7 (outer) = inner 5 and 6
+        assert!(s.contains("\x1b[6;1H"));
+        assert!(s.contains("\x1b[7;80H"));
+        // Should NOT repair row 2 (outside region)
+        assert!(!s.contains("\x1b[2;1H"));
     }
 
     // === WINCH cursor_row reset test ===

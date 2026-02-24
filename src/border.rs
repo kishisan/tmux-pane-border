@@ -43,7 +43,7 @@ pub fn render_border(width: u16, height: u16, style: BorderStyle, color: &str) -
 
     let (tl, tr, bl, br, h, v) = style_chars(style);
     let color_seq = fg_color_seq(color);
-    let reset = "\x1b[0m";
+    let reset = "\x1b[39m";
 
     let inner_width = (width - 2) as usize;
 
