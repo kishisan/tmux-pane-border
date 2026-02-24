@@ -162,11 +162,25 @@ fn run(
         if sig_flags.take_usr1() {
             is_active = true;
             redraw_border(cur_outer_cols, cur_outer_rows, is_active, config);
+            // Restore scroll region (redraw_border uses CSI s/u which doesn't preserve it)
+            let inner_height = cur_outer_rows.saturating_sub(2);
+            let (st, sb) = filter_state.get_scroll_region(inner_height);
+            let outer_top = st + 1;
+            let outer_bottom = sb + 1;
+            write!(stdout, "\x1b[{outer_top};{outer_bottom}r").ok();
+            stdout.flush().ok();
         }
 
         if sig_flags.take_usr2() {
             is_active = false;
             redraw_border(cur_outer_cols, cur_outer_rows, is_active, config);
+            // Restore scroll region (redraw_border uses CSI s/u which doesn't preserve it)
+            let inner_height = cur_outer_rows.saturating_sub(2);
+            let (st, sb) = filter_state.get_scroll_region(inner_height);
+            let outer_top = st + 1;
+            let outer_bottom = sb + 1;
+            write!(stdout, "\x1b[{outer_top};{outer_bottom}r").ok();
+            stdout.flush().ok();
         }
 
         // Poll for I/O

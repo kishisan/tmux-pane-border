@@ -50,7 +50,7 @@ pub fn render_border(width: u16, height: u16, style: BorderStyle, color: &str) -
     let mut buf = String::with_capacity((width as usize + 20) * height as usize);
 
     // Save cursor, hide cursor
-    buf.push_str("\x1b7");       // DECSC (save cursor position)
+    buf.push_str("\x1b[s");      // SCP (save cursor position)
     buf.push_str("\x1b[?25l");
 
     // Top border: move to row 1, col 1
@@ -75,7 +75,7 @@ pub fn render_border(width: u16, height: u16, style: BorderStyle, color: &str) -
 
     // Show cursor, restore cursor position
     buf.push_str("\x1b[?25h");
-    buf.push_str("\x1b8");       // DECRC (restore cursor position)
+    buf.push_str("\x1b[u");      // RCP (restore cursor position)
 
     buf
 }
